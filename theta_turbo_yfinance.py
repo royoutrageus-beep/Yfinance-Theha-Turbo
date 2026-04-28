@@ -909,17 +909,45 @@ with tab_scanner:
         prog_ph   = st.empty()
         pb        = st.progress(0)
 
-        # ── PHASE 1: Fetch data ──
-        prog_ph.markdown(
-            f'<div style="color:#ff7b00;font-family:Space Mono,monospace;font-size:12px;">'
-            f'⚡ Phase 1/2: Fetching {n_scan} saham (10 threads parallel)...</div>',
-            unsafe_allow_html=True)
-        pb.progress(0.1)
+        # ── Helper parse yFinance result ──
+        def _parse_yf(raw, sym):
+            """Parse yf.download result — handle semua versi MultiIndex"""
+            try:
+                df = None
+                if isinstance(raw.columns, pd.MultiIndex):
+                    # Coba direct key access dulu (paling reliable)
+                    if sym in raw.columns.get_level_values(0):
+                        df = raw[sym].copy()
+                    elif sym in raw.columns.get_level_values(1):
+                        df = raw.xs(sym, axis=1, level=1).copy()
+                    # Coba tanpa .JK
+                    elif sym.replace(".JK","") in raw.columns.get_level_values(0):
+                        df = raw[sym.replace(".JK","")].copy()
+                    elif sym.replace(".JK","") in raw.columns.get_level_values(1):
+                        df = raw.xs(sym.replace(".JK",""), axis=1, level=1).copy()
+                else:
+                    df = raw.copy()
+                if df is None: return None
+                # Normalize kolom
+                df.columns = [str(c).strip().title() for c in df.columns]
+                needed = [c for c in ["Open","High","Low","Close","Volume"] if c in df.columns]
+                if len(needed) < 4: return None
+                df = df[needed].dropna()
+                if len(df) < 20: return None
+                df.index = pd.to_datetime(df.index)
+                if df.index.tz is None:
+                    df.index = df.index.tz_localize("UTC").tz_convert("Asia/Jakarta")
+                else:
+                    df.index = df.index.tz_convert("Asia/Jakarta")
+                return df.sort_index()
+            except: return None
 
         data_dict = {}
         try:
+            import yfinance as yf
             ticker_list = list(scan_list)
-            # Cache check dulu
+
+            # ── Cache check ──
             need_fetch = []
             for t in ticker_list:
                 raw_t = t.replace(".JK","").upper()
@@ -932,57 +960,93 @@ with tab_scanner:
 
             n_cached = len(data_dict)
             n_need   = len(need_fetch)
-            prog_ph.markdown(
-                f'<div style="color:#ff7b00;font-family:Space Mono,monospace;font-size:11px;">'
-                f'⚡ {n_cached} dari cache · {n_need} perlu fetch · 10 threads...</div>',
-                unsafe_allow_html=True)
 
-            # Parallel fetch 10 threads — DS primary, yFinance fallback
-            def _f(t):
-                raw_t = t.replace(".JK","").upper()
-                # Try DS dulu
-                if DS_KEY:
-                    df = fetch_ds_ohlcv(raw_t, "15m", 200, True)
-                    if df is not None and len(df) >= 20:
-                        return t, df
-                # yFinance fallback kalau DS gagal / no key
-                try:
-                    import yfinance as yf
-                    raw_df = yf.download(raw_t+".JK", period="5d", interval="15m",
-                                         progress=False, auto_adjust=True)
-                    if raw_df is not None and len(raw_df) >= 20:
-                        if isinstance(raw_df.columns, pd.MultiIndex):
-                            raw_df.columns = raw_df.columns.droplevel(1)
-                        raw_df = raw_df[["Open","High","Low","Close","Volume"]].dropna()
-                        raw_df.index = pd.to_datetime(raw_df.index)
-                        if raw_df.index.tz is None:
-                            raw_df.index = raw_df.index.tz_localize("UTC").tz_convert("Asia/Jakarta")
-                        else:
-                            raw_df.index = raw_df.index.tz_convert("Asia/Jakarta")
-                        if len(raw_df) >= 20:
-                            _cache_set(raw_t, "15m", raw_df)
-                            return t, raw_df
-                except: pass
-                return t, None
+            if DS_KEY and n_need > 0:
+                # ── DS parallel fetch ──
+                prog_ph.markdown(
+                    f'<div style="color:#ff7b00;font-family:Space Mono,monospace;font-size:11px;">'
+                    f'⚡ DS: {n_cached} cache · {n_need} fetch (10 threads)...</div>',
+                    unsafe_allow_html=True)
 
-            done_count = [0]
-            with ThreadPoolExecutor(max_workers=10) as ex:
-                futs = {ex.submit(_f, t): t for t in need_fetch}
-                for fut in as_completed(futs):
+                def _f_ds(t):
+                    raw_t = t.replace(".JK","").upper()
+                    return t, fetch_ds_ohlcv(raw_t, "15m", 200, True)
+
+                ds_failed = []
+                done_count = [0]
+                with ThreadPoolExecutor(max_workers=10) as ex:
+                    futs = {ex.submit(_f_ds, t): t for t in need_fetch}
+                    for fut in as_completed(futs):
+                        try:
+                            t, df = fut.result(timeout=15)
+                            done_count[0] += 1
+                            if df is not None and len(df) >= 20:
+                                data_dict[t] = df
+                            else:
+                                ds_failed.append(t)
+                            if done_count[0] % 20 == 0:
+                                pct = 0.1 + (done_count[0] / max(n_need, 1)) * 0.50
+                                pb.progress(min(pct, 0.60))
+                                prog_ph.markdown(
+                                    f'<div style="color:#ff7b00;font-family:Space Mono,monospace;font-size:11px;">'
+                                    f'⚡ DS fetched {done_count[0]}/{n_need} · OK: {len(data_dict)}...</div>',
+                                    unsafe_allow_html=True)
+                        except:
+                            ds_failed.append(futs.get(fut, "?"))
+
+                # yFinance fallback untuk yang DS-nya gagal (BATCH, bukan thread)
+                if ds_failed:
+                    prog_ph.markdown(
+                        f'<div style="color:#00e5ff;font-family:Space Mono,monospace;font-size:11px;">'
+                        f'📊 yFinance fallback {len(ds_failed)} saham (batch)...</div>',
+                        unsafe_allow_html=True)
+                    BATCH = 20
+                    for i in range(0, len(ds_failed), BATCH):
+                        batch = ds_failed[i:i+BATCH]
+                        syms  = [t for t in batch]
+                        pb.progress(0.60 + (i/max(len(ds_failed),1))*0.15)
+                        try:
+                            raw = yf.download(
+                                " ".join(syms), period="5d", interval="15m",
+                                group_by="ticker", progress=False, auto_adjust=True)
+                            if raw is None or len(raw) == 0: continue
+                            for sym in syms:
+                                raw_t = sym.replace(".JK","").upper()
+                                df = _parse_yf(raw, sym) if len(syms) > 1 else _parse_yf(raw, sym)
+                                if df is not None:
+                                    _cache_set(raw_t, "15m", df)
+                                    data_dict[sym] = df
+                        except: pass
+                        time.sleep(0.1)
+
+            elif n_need > 0:
+                # Tidak ada DS key → full yFinance batch
+                prog_ph.markdown(
+                    f'<div style="color:#00e5ff;font-family:Space Mono,monospace;font-size:11px;">'
+                    f'📊 yFinance: {n_cached} cache · {n_need} fetch (batch)...</div>',
+                    unsafe_allow_html=True)
+                BATCH = 20
+                for i in range(0, len(need_fetch), BATCH):
+                    batch = need_fetch[i:i+BATCH]
+                    pb.progress(0.10 + (i/max(len(need_fetch),1))*0.55)
+                    if i % 60 == 0:
+                        prog_ph.markdown(
+                            f'<div style="color:#00e5ff;font-family:Space Mono,monospace;font-size:11px;">'
+                            f'📊 yFinance batch {i//BATCH+1} · OK: {len(data_dict)}...</div>',
+                            unsafe_allow_html=True)
                     try:
-                        t, df = fut.result(timeout=15)
-                        done_count[0] += 1
-                        if df is not None and len(df) >= 20:
-                            data_dict[t] = df
-                        # Update progress setiap 20 ticker
-                        if done_count[0] % 20 == 0:
-                            pct = 0.1 + (done_count[0] / max(n_need, 1)) * 0.70
-                            pb.progress(min(pct, 0.80))
-                            prog_ph.markdown(
-                                f'<div style="color:#ff7b00;font-family:Space Mono,monospace;font-size:11px;">'
-                                f'⚡ Fetched {done_count[0]}/{n_need} · {len(data_dict)} berhasil...</div>',
-                                unsafe_allow_html=True)
-                    except: done_count[0] += 1
+                        raw = yf.download(
+                            " ".join(batch), period="5d", interval="15m",
+                            group_by="ticker", progress=False, auto_adjust=True)
+                        if raw is None or len(raw) == 0: continue
+                        for sym in batch:
+                            raw_t = sym.replace(".JK","").upper()
+                            df = _parse_yf(raw, sym)
+                            if df is not None:
+                                _cache_set(raw_t, "15m", df)
+                                data_dict[sym] = df
+                    except: pass
+                    time.sleep(0.1)
 
             st.session_state.data_dict = data_dict
 
@@ -1001,18 +1065,20 @@ with tab_scanner:
                 if DS_KEY:
                     df = fetch_ds_ohlcv(raw_t, "daily", 100, False)
                     if df is not None and len(df) >= 2: return t, df
-                # yFinance fallback
+                # yFinance fallback — single ticker, no thread issue
                 try:
-                    import yfinance as yf
                     raw_df = yf.download(raw_t+".JK", period="60d", interval="1d",
                                          progress=False, auto_adjust=True)
                     if raw_df is not None and len(raw_df) >= 2:
                         if isinstance(raw_df.columns, pd.MultiIndex):
                             raw_df.columns = raw_df.columns.droplevel(1)
-                        raw_df = raw_df[["Open","High","Low","Close","Volume"]].dropna()
-                        raw_df.index = pd.to_datetime(raw_df.index)
-                        _cache_set(raw_t, "daily", raw_df)
-                        return t, raw_df
+                        raw_df.columns = [str(c).strip().title() for c in raw_df.columns]
+                        needed = [c for c in ["Open","High","Low","Close","Volume"] if c in raw_df.columns]
+                        if len(needed) >= 4:
+                            raw_df = raw_df[needed].dropna().sort_index()
+                            if len(raw_df) >= 2:
+                                _cache_set(raw_t, "daily", raw_df)
+                                return t, raw_df
                 except: pass
                 return t, None
             with ThreadPoolExecutor(max_workers=10) as ex:
