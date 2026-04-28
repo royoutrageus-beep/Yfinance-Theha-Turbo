@@ -1010,11 +1010,33 @@ with tab_scanner:
                 f'⚡ {n_cached} dari cache · {n_need} perlu fetch · 10 threads...</div>',
                 unsafe_allow_html=True)
 
-            # Parallel fetch 10 threads (thread-safe karena disk cache)
+            # Parallel fetch 10 threads — DS primary, yFinance fallback
             def _f(t):
                 raw_t = t.replace(".JK","").upper()
-                df = fetch_ds_ohlcv(raw_t, "15m", 200, True)
-                return t, df
+                # Try DS dulu
+                if DS_KEY:
+                    df = fetch_ds_ohlcv(raw_t, "15m", 200, True)
+                    if df is not None and len(df) >= 20:
+                        return t, df
+                # yFinance fallback kalau DS gagal / no key
+                try:
+                    import yfinance as yf
+                    raw_df = yf.download(raw_t+".JK", period="5d", interval="15m",
+                                         progress=False, auto_adjust=True)
+                    if raw_df is not None and len(raw_df) >= 20:
+                        if isinstance(raw_df.columns, pd.MultiIndex):
+                            raw_df.columns = raw_df.columns.droplevel(1)
+                        raw_df = raw_df[["Open","High","Low","Close","Volume"]].dropna()
+                        raw_df.index = pd.to_datetime(raw_df.index)
+                        if raw_df.index.tz is None:
+                            raw_df.index = raw_df.index.tz_localize("UTC").tz_convert("Asia/Jakarta")
+                        else:
+                            raw_df.index = raw_df.index.tz_convert("Asia/Jakarta")
+                        if len(raw_df) >= 20:
+                            _cache_set(raw_t, "15m", raw_df)
+                            return t, raw_df
+                except: pass
+                return t, None
 
             done_count = [0]
             with ThreadPoolExecutor(max_workers=10) as ex:
@@ -1046,11 +1068,26 @@ with tab_scanner:
             need_daily = [t for t in ticker_list]
             def _fd(t):
                 raw_t = t.replace(".JK","").upper()
-                # Try cache first
                 cached = _cache_get(raw_t, "daily")
                 if cached is not None: return t, cached
-                df = fetch_ds_ohlcv(raw_t, "daily", 100, False)
-                return t, df
+                # DS primary
+                if DS_KEY:
+                    df = fetch_ds_ohlcv(raw_t, "daily", 100, False)
+                    if df is not None and len(df) >= 2: return t, df
+                # yFinance fallback
+                try:
+                    import yfinance as yf
+                    raw_df = yf.download(raw_t+".JK", period="60d", interval="1d",
+                                         progress=False, auto_adjust=True)
+                    if raw_df is not None and len(raw_df) >= 2:
+                        if isinstance(raw_df.columns, pd.MultiIndex):
+                            raw_df.columns = raw_df.columns.droplevel(1)
+                        raw_df = raw_df[["Open","High","Low","Close","Volume"]].dropna()
+                        raw_df.index = pd.to_datetime(raw_df.index)
+                        _cache_set(raw_t, "daily", raw_df)
+                        return t, raw_df
+                except: pass
+                return t, None
             with ThreadPoolExecutor(max_workers=10) as ex:
                 futs = {ex.submit(_fd, t): t for t in need_daily}
                 for f in as_completed(futs):
