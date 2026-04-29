@@ -984,36 +984,65 @@ with tab_scanner:
 
         # ── Helper parse yFinance result ──
         def _parse_yf(raw, sym):
-            """Parse yf.download result — handle semua versi MultiIndex"""
+            """
+            Parse yf.download result — robust untuk semua versi yFinance.
+            yFinance format terbaru: MultiIndex (field, ticker) atau flat.
+            """
             try:
+                if raw is None or len(raw) == 0: return None
                 df = None
+
                 if isinstance(raw.columns, pd.MultiIndex):
-                    # Coba direct key access dulu (paling reliable)
-                    if sym in raw.columns.get_level_values(0):
-                        df = raw[sym].copy()
-                    elif sym in raw.columns.get_level_values(1):
-                        df = raw.xs(sym, axis=1, level=1).copy()
-                    # Coba tanpa .JK
-                    elif sym.replace(".JK","") in raw.columns.get_level_values(0):
-                        df = raw[sym.replace(".JK","")].copy()
-                    elif sym.replace(".JK","") in raw.columns.get_level_values(1):
-                        df = raw.xs(sym.replace(".JK",""), axis=1, level=1).copy()
+                    lvl0 = list(raw.columns.get_level_values(0).unique())
+                    lvl1 = list(raw.columns.get_level_values(1).unique())
+                    sym_clean = sym.replace(".JK","").upper()
+
+                    # Coba semua kemungkinan
+                    for key in [sym, sym_clean, sym.lower()]:
+                        if key in lvl1:
+                            try: df = raw.xs(key, axis=1, level=1).copy(); break
+                            except: pass
+                        if key in lvl0:
+                            try: df = raw[key].copy(); break
+                            except: pass
+
+                    # Kalau single ticker, droplevel langsung
+                    if df is None and len(lvl1) == 1:
+                        try:
+                            df = raw.droplevel(1, axis=1).copy()
+                        except:
+                            try: df = raw.xs(lvl1[0], axis=1, level=1).copy()
+                            except: pass
                 else:
                     df = raw.copy()
+
                 if df is None: return None
-                # Normalize kolom
-                df.columns = [str(c).strip().title() for c in df.columns]
+
+                # Normalize kolom — handle berbagai kapitalisasi
+                col_map = {}
+                for c in df.columns:
+                    c_lower = str(c).strip().lower()
+                    if c_lower == 'open':   col_map[c] = 'Open'
+                    elif c_lower == 'high': col_map[c] = 'High'
+                    elif c_lower == 'low':  col_map[c] = 'Low'
+                    elif c_lower == 'close':col_map[c] = 'Close'
+                    elif c_lower == 'volume':col_map[c]= 'Volume'
+                df = df.rename(columns=col_map)
+
                 needed = [c for c in ["Open","High","Low","Close","Volume"] if c in df.columns]
                 if len(needed) < 4: return None
                 df = df[needed].dropna()
                 if len(df) < 20: return None
+
                 df.index = pd.to_datetime(df.index)
+                df = df.sort_index()
                 if df.index.tz is None:
                     df.index = df.index.tz_localize("UTC").tz_convert("Asia/Jakarta")
                 else:
                     df.index = df.index.tz_convert("Asia/Jakarta")
-                return df.sort_index()
-            except: return None
+                return df
+            except:
+                return None
 
         data_dict = {}
         try:
@@ -1206,14 +1235,25 @@ with tab_scanner:
                             gain_pct = float(r.get('ROC3', 0)) * 100
 
                     rvol=float(r['RVOL'])
-                    if turnover < min_turn or rvol < vol_thresh: continue
+                    # Turnover filter — pakai daily kalau ada, fallback ke 15m estimate
+                    if df_d is not None and len(df_d) >= 1:
+                        # Daily turnover lebih akurat
+                        _tvol = float(df_d.iloc[-1]['Volume']) if 'Volume' in df_d.columns else vol
+                        turnover = close * _tvol
+                    else:
+                        # Estimate: 15m vol × 28 candle sehari (7 jam × 4)
+                        turnover = close * vol * 28
+                    rvol = float(r['RVOL'])
+                    # Filter longgar — yFinance tidak ada bandarmologi
+                    if turnover < min_turn * 0.3 or rvol < vol_thresh * 0.7: continue
 
-                    sig,sc_v2,flags_v2,gc_now = get_sinyal_v2(r,p,p2)
+                    sig, sc_v2, flags_v2, gc_now = get_sinyal_v2(r, p, p2)
                     aksi_v2 = get_aksi_v2(sig, gc_now, sc_v2)
                     reasons = flags_v2.split(" · ") if flags_v2 else []
-                    sc = round(min(6,max(0,sc_v2/10)),1)
+                    sc = round(min(6, max(0, sc_v2/10)), 1)
                     if "WAIT" in sig: continue
-                    if sc_v2<10: continue
+                    # sc_v2 threshold lebih rendah kalau tidak ada DS (tidak ada +10 Asing Akum +5 Smart Money)
+                    min_sc_v2 = 5 if DS_KEY else 0  # yFinance: loloskan semua non-WAIT
 
                     atr  = float(r['ATR']) if not np.isnan(float(r['ATR'])) else close*0.01
                     tp   = close+4.0*atr; sl=close-2.0*atr
@@ -1297,6 +1337,15 @@ with tab_scanner:
             {"⚡ Quick: 200 saham" if quick_mode else f"Full: {len(raw_stocks)} saham"} · Regime: {regime} · {rcfg['mode']}
           </div>
         </div>""", unsafe_allow_html=True)
+
+    elif not results and (do_scan_btn or auto_trigger):
+        # Scan ran tapi kosong — debug info
+        n_fetched = len(st.session_state.get("data_dict", {}))
+        st.warning(f"⚠️ Scan selesai tapi 0 sinyal lolos. Data fetched: {n_fetched} saham. "
+                   f"Coba: ↓ Min Turnover, ↓ Min RVOL, atau toggle Quick Mode.")
+        if n_fetched == 0:
+            st.error("❌ Data fetch gagal total — kemungkinan DS down atau yFinance rate limit. "
+                     "Coba klik 🔄 Fresh Data dan scan ulang.")
 
     elif results:
         df_out = pd.DataFrame(results).sort_values("Score",ascending=False).reset_index(drop=True)
