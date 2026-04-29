@@ -1208,7 +1208,7 @@ with tab_scanner:
                 pb.progress(0.85 + (i+1)/max(len(tickers),1)*0.14)
                 try:
                     df = data_dict[ticker_yf].copy()
-                    if len(df)<55: continue
+                    if len(df) < 30: continue  # minimum 30 bar (kurang dari 1.5 hari 15m)
                     df = apply_intraday_indicators(df)
                     r=df.iloc[-1]; p=df.iloc[-2]; p2=df.iloc[-3] if len(df)>=3 else p
                     close=float(r['Close']); vol=float(r['Volume'])
@@ -1244,16 +1244,19 @@ with tab_scanner:
                         # Estimate: 15m vol × 28 candle sehari (7 jam × 4)
                         turnover = close * vol * 28
                     rvol = float(r['RVOL'])
-                    # Filter longgar — yFinance tidak ada bandarmologi
-                    if turnover < min_turn * 0.3 or rvol < vol_thresh * 0.7: continue
+                    # Filter minimal — hanya buang yg truly tidak liquid
+                    if rvol < vol_thresh * 0.5: continue  # jauh di bawah threshold
+                    if turnover < min_turn * 0.1: continue  # < 10% dari min turnover
 
                     sig, sc_v2, flags_v2, gc_now = get_sinyal_v2(r, p, p2)
                     aksi_v2 = get_aksi_v2(sig, gc_now, sc_v2)
                     reasons = flags_v2.split(" · ") if flags_v2 else []
                     sc = round(min(6, max(0, sc_v2/10)), 1)
-                    if "WAIT" in sig: continue
-                    # sc_v2 threshold lebih rendah kalau tidak ada DS (tidak ada +10 Asing Akum +5 Smart Money)
-                    min_sc_v2 = 5 if DS_KEY else 0  # yFinance: loloskan semua non-WAIT
+
+                    # Hapus filter WAIT — di market RED semua bisa return WAIT
+                    # Tampilkan semua, sort by score, user bisa lihat kondisi tiap saham
+                    # Hanya skip kalau score sangat negatif (< -20)
+                    if sc_v2 < -20: continue
 
                     atr  = float(r['ATR']) if not np.isnan(float(r['ATR'])) else close*0.01
                     tp   = close+4.0*atr; sl=close-2.0*atr
