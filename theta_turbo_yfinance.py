@@ -235,7 +235,7 @@ def fetch_intraday(tickers, chunk=25):
 #  UPDATE get_regime_config() — tambah config Bagger
 # ════════════════════════════════════════════════════
 
-def get_regime_config(regime):
+def get_market_regime(regime):
     return {
         "RED": {
             "mode": "Reversal 🎯", "min_score": 5, "min_rvol": 2.0, "sl_mult": 0.6,
@@ -607,7 +607,7 @@ def fetch_intraday(tickers, chunk=25):
 # ════════════════════════════════════════════════════
 #  HEADER
 # ════════════════════════════════════════════════════
-regime, ihsg_price, ema20, ema55, regime_detail, ihsg_chg = get_regime_config()
+regime, ihsg_price, ema20, ema55, regime_detail, ihsg_chg = get_market_regime()
 rcfg    = get_regime_config(regime)
 rcolor  = rcfg["color"]
 chg_col = "#00ff88" if ihsg_chg >= 0 else "#ff3d5a"
