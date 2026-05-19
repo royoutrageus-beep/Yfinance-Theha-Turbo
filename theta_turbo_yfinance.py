@@ -210,7 +210,7 @@ stock_map  = {s + ".JK": s for s in raw_stocks}
 # ════════════════════════════════════════════════════
 #  MARKET REGIME DETECTOR
 # ════════════════════════════════════════════════════
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=300)
 def get_market_regime():
     try:
         df = yf.download("^JKSE", period="60d", interval="1d",
