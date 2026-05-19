@@ -231,25 +231,6 @@ def fetch_intraday(tickers, chunk=25):
     except:
         return ("UNKNOWN", 0, 0, 0, "IHSG tidak tersedia — manual mode", 0.0)
 
-# ════════════════════════════════════════════════════
-#  UPDATE get_regime_config() — tambah config Bagger
-# ════════════════════════════════════════════════════
-
-# FUNGSI 1: Untuk deteksi kondisi IHSG saat ini (Ini yang dipanggil di baris 610)
-def get_market_regime():
-    # Ini fungsi temporary agar bot kamu dapet 6 data yang dia minta di baris 610
-    # Secara default kita set GREEN dulu biar langsung masuk mode Bagger Hunt!
-    regime = "GREEN"  
-    ihsg_price = 7200.0
-    ema20 = 7150.0
-    ema55 = 7100.0
-    regime_detail = "IHSG Bullish (Temporary Fix)"
-    ihsg_chg = 0.5
-    
-    return regime, ihsg_price, ema20, ema55, regime_detail, ihsg_chg
-
-
-# FUNGSI 2: Untuk mengambil konfigurasi berdasarkan warna market (Ganti nama yang tadi salah)
 def get_regime_config(regime):
     return {
         "RED": {
