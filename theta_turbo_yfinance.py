@@ -533,19 +533,6 @@ def get_signal(score, mode):
         if score >= thresh: return t[thresh]
     return "WAIT"
 
-# ════════════════════════════════════════════════════
-#  UPDATE Scanner Settings — tambah mode Bagger
-# ════════════════════════════════════════════════════
-
-# Di dalam with sc1: — ganti radio mode
-if not auto_regime:
-    scan_mode = st.radio(
-        "Mode",
-        ["Scalping ⚡", "Momentum 🚀", "Reversal 🎯", "Bagger 💎"],  # ← tambah Bagger
-        label_visibility="collapsed",
-        key="scan_mode_radio"
-    )
-
 def get_signal(score, mode):
     t = {"Scalping ⚡":{5:"GACOR ⚡",4:"POTENSIAL 🔥",3:"WATCH 👀"},
          "Momentum 🚀":{5:"GACOR 🚀",4:"POTENSIAL 🔥",3:"WATCH 👀"},
@@ -1043,8 +1030,8 @@ with tab_scanner:
         with sc1:
             st.markdown('<div class="settings-label">MODE SIGNAL</div>', unsafe_allow_html=True)
             auto_regime = st.toggle("🤖 Auto-Mode (Market Regime)", value=True, key="auto_reg")
-            if auto_regime:
-                scan_mode = rcfg["mode"]
+            if not auto_regime:
+                scan_mode = st.radio("Mode", ["Scalping ⚡", "Momentum 🚀", "Reversal 🎯", "Bagger 💎"], label_visibility="collapsed", key="scan_mode_radio")
                 st.markdown(f'<div style="font-family:Space Mono,monospace;font-size:10px;padding:6px 10px;background:rgba(0,0,0,.3);border-radius:4px;color:{rcolor};">Auto: {scan_mode}</div>', unsafe_allow_html=True)
             else:
                 scan_mode = st.radio("Mode", ["Scalping ⚡","Momentum 🚀","Reversal 🎯"], label_visibility="collapsed", key="scan_mode_radio")
