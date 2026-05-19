@@ -61,6 +61,8 @@ html,body,[data-testid="stAppViewContainer"]{background:var(--bg)!important;colo
 .signal-card.gacor{border-color:rgba(0,255,136,.4);background:rgba(0,255,136,.03);}
 .signal-card.potensial{border-color:rgba(255,183,0,.3);background:rgba(255,183,0,.03);}
 .signal-card.watch{border-color:rgba(0,229,255,.2);}
+.signal-card.bagger{border-color: rgba(191,95,255,.6);background: rgba(191,95,255,.05);box-shadow: 0 0 20px rgba(191,95,255,.15);}
+.signal-card.bagger::after { background: var(--purple); }
 .signal-card::after{content:'';position:absolute;top:0;left:0;width:4px;height:100%;}
 .signal-card.gacor::after{background:var(--green);}
 .signal-card.potensial::after{background:var(--amber);}
@@ -208,8 +210,8 @@ stock_map  = {s + ".JK": s for s in raw_stocks}
 # ════════════════════════════════════════════════════
 #  MARKET REGIME DETECTOR
 # ════════════════════════════════════════════════════
-@st.cache_data(ttl=600)
-def get_market_regime():
+@st.cache_data(ttl=300)
+def fetch_intraday(tickers, chunk=25):
     try:
         df = yf.download("^JKSE", period="60d", interval="1d",
                          progress=False, auto_adjust=True, timeout=8)
@@ -229,22 +231,41 @@ def get_market_regime():
     except:
         return ("UNKNOWN", 0, 0, 0, "IHSG tidak tersedia — manual mode", 0.0)
 
+# ════════════════════════════════════════════════════
+#  UPDATE get_regime_config() — tambah config Bagger
+# ════════════════════════════════════════════════════
+
 def get_regime_config(regime):
     return {
-        "RED":      {"mode":"Reversal 🎯","min_score":5,"min_rvol":2.0,"sl_mult":0.6,
-                     "label":"🔴 MARKET MERAH — Reversal Only, Score ≥ 5","color":"#ff3d5a",
-                     "desc":"Market bearish. Fokus reversal oversold, filter ketat."},
-        "GREEN":    {"mode":"Scalping ⚡","min_score":4,"min_rvol":1.5,"sl_mult":0.8,
-                     "label":"🟢 MARKET HIJAU — Scalping & Momentum, Score ≥ 4","color":"#00ff88",
-                     "desc":"Market bullish. Scalping & Momentum optimal."},
-        "SIDEWAYS": {"mode":"Scalping ⚡","min_score":4,"min_rvol":2.0,"sl_mult":0.7,
-                     "label":"🟡 MARKET SIDEWAYS — Semua Mode, RVOL ≥ 2x","color":"#ffb700",
-                     "desc":"Market sideways. RVOL harus lebih kuat."},
-        "UNKNOWN":  {"mode":"Scalping ⚡","min_score":4,"min_rvol":1.5,"sl_mult":0.8,
-                     "label":"⚪ REGIME UNKNOWN — Manual Mode","color":"#4a5568",
-                     "desc":"Tidak bisa deteksi kondisi market."},
-    }.get(regime, {"mode":"Scalping ⚡","min_score":4,"min_rvol":1.5,"sl_mult":0.8,
-                   "label":"⚪ UNKNOWN","color":"#4a5568","desc":""})
+        "RED": {
+            "mode": "Reversal 🎯", "min_score": 5, "min_rvol": 2.0, "sl_mult": 0.6,
+            "label": "🔴 MARKET MERAH — Reversal Only, Score ≥ 5",
+            "color": "#ff3d5a",
+            "desc": "Market bearish. Fokus reversal oversold, filter ketat."
+        },
+        "GREEN": {
+            "mode": "Bagger 💎",   # ← Saat market hijau, fokus cari bagger!
+            "min_score": 4, "min_rvol": 2.0, "sl_mult": 0.8,
+            "label": "🟢 MARKET HIJAU — Bagger Hunt Mode, Score ≥ 4",
+            "color": "#00ff88",
+            "desc": "Market bullish. Cari breakout bagger dengan volume surge."
+        },
+        "SIDEWAYS": {
+            "mode": "Scalping ⚡", "min_score": 4, "min_rvol": 2.0, "sl_mult": 0.7,
+            "label": "🟡 MARKET SIDEWAYS — Scalping, RVOL ≥ 2x",
+            "color": "#ffb700",
+            "desc": "Market sideways. RVOL harus lebih kuat."
+        },
+        "UNKNOWN": {
+            "mode": "Scalping ⚡", "min_score": 4, "min_rvol": 1.5, "sl_mult": 0.8,
+            "label": "⚪ REGIME UNKNOWN — Manual Mode",
+            "color": "#4a5568",
+            "desc": "Tidak bisa deteksi kondisi market."
+        },
+    }.get(regime, {
+        "mode": "Scalping ⚡", "min_score": 4, "min_rvol": 1.5, "sl_mult": 0.8,
+        "label": "⚪ UNKNOWN", "color": "#4a5568", "desc": ""
+    })
 
 # ════════════════════════════════════════════════════
 #  INDICATORS
@@ -375,6 +396,156 @@ def score_reversal(r, p, p2):
     if float(r['BodyRatio'])>0.75 and float(r['Close'])<float(r['Open']): score-=0.8; reasons.append("⚠️ Bearish bar kuat")
     return max(0,min(6,round(score,1))), reasons, {}
 
+# ════════════════════════════════════════════════════
+#  BAGGER DETECTOR — Scoring Function Baru
+#  Tambahkan setelah score_reversal(), sebelum get_signal()
+# ════════════════════════════════════════════════════
+
+def score_bagger(r, p, p2, df_full):
+    """
+    Scoring khusus multi-bagger candidate.
+    Deteksi: breakout + akumulasi + momentum kuat + squeeze expansion.
+    
+    Beda dari scalping: fokus ke setup yang bisa lari jauh (2-5x ATR),
+    bukan scalp cepat. Entry ideal: awal breakout, bukan saat sudah naik.
+    """
+    score = 0
+    reasons = []
+    
+    # ── 1. BREAKOUT DETECTION ──────────────────────────
+    # Close di atas high N bar terakhir = breakout nyata
+    lookback = min(20, len(df_full) - 1)
+    recent_high = df_full['High'].iloc[-(lookback+1):-1].max()
+    recent_low  = df_full['Low'].iloc[-(lookback+1):-1].min()
+    close = float(r['Close'])
+    
+    if close > recent_high:
+        score += 2.5
+        reasons.append(f"BREAKOUT {lookback}B high ✦✦✦")
+    elif close > recent_high * 0.995:
+        score += 1.5
+        reasons.append(f"Approaching {lookback}B high")
+    
+    # ── 2. BOLLINGER SQUEEZE → EXPANSION ───────────────
+    # BB width kecil lalu expand = tanda volatility breakout
+    bb_width     = float(r['BB_upper']) - float(r['BB_lower'])
+    if len(df_full) >= 10:
+        bb_prev10    = df_full['BB_std'].iloc[-10:].mean()
+        bb_curr      = float(r['BB_std'])
+        squeeze_ratio = bb_curr / max(bb_prev10, 0.001)
+        if squeeze_ratio > 1.5:
+            score += 1.5
+            reasons.append(f"BB squeeze expand {squeeze_ratio:.1f}x ✦")
+        elif squeeze_ratio > 1.2:
+            score += 0.8
+            reasons.append(f"BB expanding {squeeze_ratio:.1f}x")
+    
+    # ── 3. VOLUME ACCUMULATION TREND ───────────────────
+    # Volume terus naik 3 bar terakhir = akumulasi aktif
+    if len(df_full) >= 4:
+        v1 = float(df_full['Volume'].iloc[-4])
+        v2 = float(df_full['Volume'].iloc[-3])
+        v3 = float(df_full['Volume'].iloc[-2])
+        v4 = float(r['Volume'])
+        vol_trend = (v2 > v1) + (v3 > v2) + (v4 > v3)  # 0-3
+        if vol_trend == 3:
+            score += 1.5
+            reasons.append("Vol akumulasi 3 bar ✦✦")
+        elif vol_trend >= 2:
+            score += 0.8
+            reasons.append("Vol akumulasi trend ↑")
+    
+    # ── 4. RVOL SURGE — breakout butuh volume ──────────
+    rvol = float(r['RVOL'])
+    if rvol > 4.0:   score += 2.0; reasons.append(f"RVOL={rvol:.1f}x MASSIVE 🔥🔥")
+    elif rvol > 3.0: score += 1.5; reasons.append(f"RVOL={rvol:.1f}x SURGE 🔥")
+    elif rvol > 2.0: score += 0.8; reasons.append(f"RVOL={rvol:.1f}x")
+    elif rvol < 1.5: score -= 0.5  # breakout tanpa volume = suspicious
+    
+    # ── 5. MOMENTUM MULTI-BAR ──────────────────────────
+    # ROC naik konsisten beberapa bar
+    roc3 = float(r['ROC3']) * 100
+    roc8 = float(r['ROC8']) * 100
+    if roc3 > 3 and roc8 > 5:
+        score += 1.5; reasons.append(f"ROC3={roc3:.1f}% · ROC8={roc8:.1f}% 🚀")
+    elif roc3 > 2:
+        score += 0.8; reasons.append(f"ROC3={roc3:.1f}%")
+    elif roc3 < 0 and roc8 < 0:
+        score -= 1.0  # double negative momentum
+    
+    # ── 6. EMA GOLDEN STACK ────────────────────────────
+    e9=float(r['EMA9']); e21=float(r['EMA21']); e50=float(r['EMA50']); e200=float(r['EMA200'])
+    if e9 > e21 > e50 > e200:
+        score += 2.0; reasons.append("EMA full golden stack ✦✦")
+    elif e9 > e21 > e50:
+        score += 1.2; reasons.append("EMA stack ▲")
+    elif e9 > e21:
+        score += 0.5
+    
+    # ── 7. RSI MOMENTUM ZONE ───────────────────────────
+    rsi_e = float(r['RSI_EMA'])
+    if 55 < rsi_e < 72:
+        score += 1.0; reasons.append(f"RSI-EMA={rsi_e:.1f} momentum zone")
+    elif rsi_e >= 72:
+        score -= 0.5; reasons.append(f"⚠️ RSI overbought {rsi_e:.1f}")
+    elif rsi_e < 45:
+        score -= 0.5  # bagger butuh momentum, bukan reversal
+    
+    # ── 8. NET BUYER PRESSURE ──────────────────────────
+    netvol3 = float(r['NetVol3'])
+    netvol8 = float(r['NetVol8'])
+    if netvol3 > 0 and netvol8 > 0:
+        score += 1.0; reasons.append("Net buyer 8 bar")
+    elif netvol3 > 0:
+        score += 0.4; reasons.append("Net buyer 3 bar")
+    
+    # ── 9. ABOVE VWAP & EMA200 ─────────────────────────
+    if close > float(r['VWAP']):
+        score += 0.5; reasons.append("Above VWAP")
+    if close < e200 * 0.95:
+        score -= 1.0  # bagger gak mungkin kalau masih jauh di bawah EMA200
+    
+    # ── 10. CONSECUTIVE BULLISH BARS ───────────────────
+    if len(df_full) >= 4:
+        bull_count = sum(
+            1 for i in range(-3, 0)
+            if float(df_full['Close'].iloc[i]) > float(df_full['Open'].iloc[i])
+        )
+        if bull_count == 3:
+            score += 0.8; reasons.append("3 consecutive bull bars")
+        elif bull_count == 2:
+            score += 0.3
+    
+    return max(0, min(6, round(score, 1))), reasons, {}
+
+# ════════════════════════════════════════════════════
+#  UPDATE get_signal() — tambah Bagger mode
+# ════════════════════════════════════════════════════
+
+def get_signal(score, mode):
+    t = {
+        "Scalping ⚡":    {5:"GACOR ⚡",  4:"POTENSIAL 🔥", 3:"WATCH 👀"},
+        "Momentum 🚀":    {5:"GACOR 🚀",  4:"POTENSIAL 🔥", 3:"WATCH 👀"},
+        "Reversal 🎯":    {5:"REVERSAL 🎯",4:"POTENSIAL 🔥", 3:"WATCH 👀"},
+        "Bagger 💎":      {5:"BAGGER 💎",  4:"KANDIDAT 🚀",  3:"WATCH 👀"},  # ← BARU
+    }.get(mode, {})
+    for thresh in sorted(t.keys(), reverse=True):
+        if score >= thresh: return t[thresh]
+    return "WAIT"
+
+# ════════════════════════════════════════════════════
+#  UPDATE Scanner Settings — tambah mode Bagger
+# ════════════════════════════════════════════════════
+
+# Di dalam with sc1: — ganti radio mode
+if not auto_regime:
+    scan_mode = st.radio(
+        "Mode",
+        ["Scalping ⚡", "Momentum 🚀", "Reversal 🎯", "Bagger 💎"],  # ← tambah Bagger
+        label_visibility="collapsed",
+        key="scan_mode_radio"
+    )
+
 def get_signal(score, mode):
     t = {"Scalping ⚡":{5:"GACOR ⚡",4:"POTENSIAL 🔥",3:"WATCH 👀"},
          "Momentum 🚀":{5:"GACOR 🚀",4:"POTENSIAL 🔥",3:"WATCH 👀"},
@@ -383,9 +554,14 @@ def get_signal(score, mode):
         if score >= thresh: return t[thresh]
     return "WAIT"
 
+# ════════════════════════════════════════════════════
+#  UPDATE get_card_class() — tambah class bagger
+# ════════════════════════════════════════════════════
+
 def get_card_class(signal):
+    if "BAGGER" in signal:   return "bagger"    # ← BARU
     if "GACOR" in signal or "REVERSAL" in signal: return "gacor"
-    if "POTENSIAL" in signal: return "potensial"
+    if "KANDIDAT" in signal or "POTENSIAL" in signal: return "potensial"
     if "WATCH" in signal: return "watch"
     return ""
 
@@ -896,10 +1072,12 @@ with tab_scanner:
 
     # Auto-refresh trigger — fresh timestamp setiap check
     _now_check = datetime.now(jakarta_tz).timestamp()
+    auto_triggered = False
     if st.session_state.last_scan_time and not do_scan:
         _elapsed = _now_check - st.session_state.last_scan_time
         if _elapsed >= 300 and st.session_state.scan_results:
-            do_scan = True  # auto trigger setiap 5 menit
+            do_scan = True
+            auto_triggered = True
 
     if do_scan:
         scan_list = stocks_yf[:200] if quick_mode else stocks_yf
@@ -920,9 +1098,15 @@ with tab_scanner:
                     r=df.iloc[-1]; p=df.iloc[-2]; p2=df.iloc[-3] if len(df)>=3 else p
                     close=float(r['Close']); vol=float(r['Volume']); turnover=close*vol; rvol=float(r['RVOL'])
                     if turnover<min_turn or rvol<vol_thresh: continue
-                    if scan_mode=="Scalping ⚡":   sc,reasons,_=score_scalping(r,p,p2)
-                    elif scan_mode=="Momentum 🚀": sc,reasons,_=score_momentum(r,p,p2)
-                    else:                          sc,reasons,_=score_reversal(r,p,p2)
+                    if scan_mode == "Scalping ⚡":   sc, reasons, _ = score_scalping(r, p, p2)
+                    elif scan_mode == "Momentum 🚀": sc, reasons, _ = score_momentum(r, p, p2)
+                    elif scan_mode == "Bagger 💎":   sc, reasons, _ = score_bagger(r, p, p2, df)
+                    else:                             sc, reasons, _ = score_reversal(r, p, p2)
+                    # Update TP/SL untuk Bagger — target lebih jauh
+                    if scan_mode == "Scalping ⚡":   tp=close+1.5*atr; sl=close-slm*atr
+                    elif scan_mode == "Momentum 🚀": tp=close+2.0*atr; sl=close-slm*atr
+                    elif scan_mode == "Bagger 💎":   tp=close+3.0*atr; sl=close-1.0*atr
+                    else:                             tp=close+2.5*atr; sl=close-slm*atr
                     if sc<min_score: continue
                     sig=get_signal(sc,scan_mode)
                     if sig=="WAIT": continue
@@ -2019,10 +2203,11 @@ with tab_backtest:
 # ════════════════════════════════════════════════════
 _now_f = datetime.now(jakarta_tz).timestamp()
 if st.session_state.last_scan_time:
-    _rem2 = max(0, 300 - (_now_f - st.session_state.last_scan_time))
-    mnt2 = int(_rem2//60); sec2 = int(_rem2%60)
-    last_t2 = datetime.fromtimestamp(st.session_state.last_scan_time, jakarta_tz).strftime("%H:%M:%S")
-    time_info = f"⏱️ Next auto-scan: <span style='color:#ff7b00'>{mnt2:02d}:{sec2:02d}</span> · Last: <span style='color:#2dd4bf'>{last_t2} WIB</span>"
+    _now_f2 = datetime.now(jakarta_tz).timestamp()
+    _elapsed = _now_f2 - st.session_state.last_scan_time
+    if _elapsed >= 295:          # hampir 5 menit
+     time.sleep(5)            # sleep singkat baru rerun
+      st.rerun()
 else:
     time_info = "⏱️ Klik Scan untuk mulai"
 st.markdown(f"""
@@ -2035,5 +2220,5 @@ st.markdown(f"""
 # Auto-refresh countdown — hanya aktif setelah scan pertama
 # Tidak sleep kalau belum pernah scan (biar tombol langsung respond)
 if st.session_state.last_scan_time:
-    time.sleep(30)
+    time.sleep(5)
     st.rerun()
