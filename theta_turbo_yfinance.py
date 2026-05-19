@@ -210,8 +210,8 @@ stock_map  = {s + ".JK": s for s in raw_stocks}
 # ════════════════════════════════════════════════════
 #  MARKET REGIME DETECTOR
 # ════════════════════════════════════════════════════
-@st.cache_data(ttl=300)
-def fetch_intraday(tickers, chunk=25):
+@st.cache_data(ttl=600)
+def get_market_regime():
     try:
         df = yf.download("^JKSE", period="60d", interval="1d",
                          progress=False, auto_adjust=True, timeout=8)
@@ -262,6 +262,7 @@ def get_regime_config(regime):
         "mode": "Scalping ⚡", "min_score": 4, "min_rvol": 1.5, "sl_mult": 0.8,
         "label": "⚪ UNKNOWN", "color": "#4a5568", "desc": ""
     })
+
 # ════════════════════════════════════════════════════
 #  INDICATORS
 # ════════════════════════════════════════════════════
