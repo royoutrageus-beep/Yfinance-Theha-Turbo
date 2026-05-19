@@ -235,7 +235,22 @@ def fetch_intraday(tickers, chunk=25):
 #  UPDATE get_regime_config() — tambah config Bagger
 # ════════════════════════════════════════════════════
 
-def get_market_regime(regime):
+# FUNGSI 1: Untuk deteksi kondisi IHSG saat ini (Ini yang dipanggil di baris 610)
+def get_market_regime():
+    # Ini fungsi temporary agar bot kamu dapet 6 data yang dia minta di baris 610
+    # Secara default kita set GREEN dulu biar langsung masuk mode Bagger Hunt!
+    regime = "GREEN"  
+    ihsg_price = 7200.0
+    ema20 = 7150.0
+    ema55 = 7100.0
+    regime_detail = "IHSG Bullish (Temporary Fix)"
+    ihsg_chg = 0.5
+    
+    return regime, ihsg_price, ema20, ema55, regime_detail, ihsg_chg
+
+
+# FUNGSI 2: Untuk mengambil konfigurasi berdasarkan warna market (Ganti nama yang tadi salah)
+def get_regime_config(regime):
     return {
         "RED": {
             "mode": "Reversal 🎯", "min_score": 5, "min_rvol": 2.0, "sl_mult": 0.6,
@@ -266,7 +281,6 @@ def get_market_regime(regime):
         "mode": "Scalping ⚡", "min_score": 4, "min_rvol": 1.5, "sl_mult": 0.8,
         "label": "⚪ UNKNOWN", "color": "#4a5568", "desc": ""
     })
-
 # ════════════════════════════════════════════════════
 #  INDICATORS
 # ════════════════════════════════════════════════════
