@@ -2207,7 +2207,7 @@ if st.session_state.last_scan_time:
     _elapsed = _now_f2 - st.session_state.last_scan_time
     if _elapsed >= 295:          # hampir 5 menit
      time.sleep(5)            # sleep singkat baru rerun
-      st.rerun()
+    st.rerun()
 else:
     time_info = "⏱️ Klik Scan untuk mulai"
 st.markdown(f"""
