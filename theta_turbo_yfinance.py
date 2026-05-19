@@ -581,7 +581,7 @@ def send_telegram(results_top, source="Scanner"):
 # ════════════════════════════════════════════════════
 #  DATA FETCH — cache 15 menit
 # ════════════════════════════════════════════════════
-@st.cache_data(ttl=360)
+@st.cache_data(ttl=300)
 def fetch_intraday(tickers, chunk=25):
     all_dfs = {}
     for i in range(0, len(tickers), chunk):
@@ -2190,18 +2190,4 @@ if st.session_state.last_scan_time:
     _elapsed = _now_f2 - st.session_state.last_scan_time
     if _elapsed >= 295:          # hampir 5 menit
      time.sleep(5)            # sleep singkat baru rerun
-    st.rerun()
-else:
-    time_info = "⏱️ Klik Scan untuk mulai"
-st.markdown(f"""
-<div style="margin-top:28px;padding-top:14px;border-top:1px solid #1c2533;
-     display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;">
-  <div style="font-family:Space Mono,monospace;font-size:10px;color:#4a5568;">🔥 Theta Turbo v5.0 · yFinance · Auto Regime</div>
-  <div style="font-family:Space Mono,monospace;font-size:10px;color:#4a5568;">{time_info}</div>
-</div>""", unsafe_allow_html=True)
-
-# Auto-refresh countdown — hanya aktif setelah scan pertama
-# Tidak sleep kalau belum pernah scan (biar tombol langsung respond)
-if st.session_state.last_scan_time:
-    time.sleep(5)
     st.rerun()
