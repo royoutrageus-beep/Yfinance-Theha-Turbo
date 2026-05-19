@@ -607,7 +607,7 @@ def fetch_intraday(tickers, chunk=25):
 # ════════════════════════════════════════════════════
 #  HEADER
 # ════════════════════════════════════════════════════
-regime, ihsg_price, ema20, ema55, regime_detail, ihsg_chg = get_market_regime()
+regime, ihsg_price, ema20, ema55, regime_detail, ihsg_chg = get_regime_config()
 rcfg    = get_regime_config(regime)
 rcolor  = rcfg["color"]
 chg_col = "#00ff88" if ihsg_chg >= 0 else "#ff3d5a"
