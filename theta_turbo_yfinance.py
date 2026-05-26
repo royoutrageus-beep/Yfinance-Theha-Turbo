@@ -8,9 +8,7 @@ import pytz
 from datetime import datetime
 
 # ════════════════════════════════════════════════════
-#  CONFIG — isi di Streamlit Secrets
-#  TELEGRAM_TOKEN = "xxx"
-#  TELEGRAM_CHAT_ID = "xxx"
+#  CONFIG
 # ════════════════════════════════════════════════════
 TOKEN      = st.secrets.get("TELEGRAM_TOKEN", "")
 CHAT_ID    = st.secrets.get("TELEGRAM_CHAT_ID", "")
@@ -19,10 +17,12 @@ jakarta_tz = pytz.timezone('Asia/Jakarta')
 for _k, _v in [("tt_last_sent", set()), ("wl_results", []),
                 ("wl_mode_used", ""), ("scan_results", []),
                 ("data_dict", {}), ("last_scan_time", None),
-                ("last_scan_mode", "Scalping ⚡")]:
+                ("last_scan_mode", "Scalping ⚡"),
+                ("active_scan_mode", "Scalping ⚡"),
+                ("active_auto_regime", True)]:
     if _k not in st.session_state: st.session_state[_k] = _v
 
-st.set_page_config(layout="wide", page_title="Theta Turbo v5", page_icon="🔥",
+st.set_page_config(layout="wide", page_title="Theta Turbo v5.2", page_icon="🔥",
                    initial_sidebar_state="collapsed")
 
 st.markdown("""
@@ -208,32 +208,120 @@ raw_stocks = [
     "YELO","YOII","YPAS","YULE","YUPI","ZATA","ZBRA","ZENI","ZINC","ZONE","ZYRX",
 ]
 seen = set(); raw_stocks = [x for x in raw_stocks if not (x in seen or seen.add(x))]
-stocks_yf = [s + ".JK" for s in raw_stocks]
+stocks_yf  = [s + ".JK" for s in raw_stocks]
 stock_map  = {s + ".JK": s for s in raw_stocks}
 
+
 # ════════════════════════════════════════════════════
-#  MARKET REGIME DETECTOR — IHSG
+#  YFINANCE SAFE EXTRACTOR
+#  FIX: yfinance 0.2.x+ MultiIndex structure changed
+#  Old: raw[ticker] → DataFrame  ✅
+#  New (some versions): raw has (Price, Ticker) not (Ticker, Price) → raw[ticker] KeyError
 # ════════════════════════════════════════════════════
-@st.cache_data(ttl=600)
+def _yf_extract(raw, ticker, n_batch):
+    """
+    Robust extraction dari yfinance multi-download result.
+    Handles semua versi yfinance (0.1.x, 0.2.x, 0.2.31+).
+    """
+    try:
+        if raw is None or raw.empty:
+            return None
+        if n_batch == 1:
+            df = raw.copy()
+        else:
+            if not isinstance(raw.columns, pd.MultiIndex):
+                return None
+            # Cek level mana yang berisi ticker
+            l0 = list(raw.columns.get_level_values(0).unique())
+            l1 = list(raw.columns.get_level_values(1).unique())
+            if ticker in l0:
+                df = raw[ticker].copy()
+            elif ticker in l1:
+                df = raw.xs(ticker, axis=1, level=1).copy()
+            else:
+                return None
+
+        # Flatten remaining MultiIndex
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.droplevel(-1)
+
+        # Rename kolom kalau lowercase (beberapa versi yf return lowercase)
+        rename_map = {c: c.capitalize() for c in df.columns if c.islower()}
+        if rename_map:
+            df = df.rename(columns=rename_map)
+        # Handle 'Adj Close' → skip, pakai 'Close' yang sudah auto_adjust
+        required = ['Open', 'High', 'Low', 'Close', 'Volume']
+        missing  = [c for c in required if c not in df.columns]
+        if missing:
+            return None
+
+        df = df[required].copy()
+        df = df.dropna(subset=['Close'])
+        df = df[df['Volume'] > 0]   # buang bar dengan volume 0
+        return df if len(df) > 0 else None
+    except:
+        return None
+
+# ════════════════════════════════════════════════════
+#  MARKET REGIME DETECTOR — IHSG (FIXED)
+#  FIX 1: Tolerance band ±1.2% — jangan RED kalau hampir di EMA20
+#  FIX 2: Momentum factor — naik hari ini = tidak RED
+#  FIX 3: MultiIndex handling yfinance terbaru
+# ════════════════════════════════════════════════════
+@st.cache_data(ttl=300)   # 5 menit — lebih responsif
 def get_market_regime():
     try:
         df = yf.download("^JKSE", period="60d", interval="1d",
-                         progress=False, auto_adjust=True, timeout=8)
-        if df is None or len(df) < 10:
-            return ("UNKNOWN", 0, 0, 0, "Data kurang", 0.0)
-        close = df["Close"].squeeze()
+                         progress=False, auto_adjust=True, timeout=10)
+        if df is None or df.empty or len(df) < 10:
+            return ("UNKNOWN", 0, 0, 0, "Data IHSG kurang", 0.0)
+
+        # FIX: handle MultiIndex dari yfinance terbaru
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.droplevel(-1)
+        close = df["Close"].dropna()
+        if isinstance(close, pd.DataFrame):
+            close = close.iloc[:, 0]
+        if len(close) < 10:
+            return ("UNKNOWN", 0, 0, 0, "Data close kurang", 0.0)
+
         ema20 = float(close.ewm(span=20, adjust=False).mean().iloc[-1])
         ema55 = float(close.ewm(span=min(55, len(close)-1), adjust=False).mean().iloc[-1])
         price = float(close.iloc[-1])
         chg   = float(((close.iloc[-1] - close.iloc[-2]) / close.iloc[-2]) * 100)
-        if price < ema20:
-            return ("RED",      price, ema20, ema55, f"IHSG {price:,.0f} < EMA20 → Bearish", chg)
-        elif price > ema20 and price > ema55:
-            return ("GREEN",    price, ema20, ema55, f"IHSG {price:,.0f} > EMA20 & EMA55 → Bullish", chg)
+
+        # ── Regime logic lebih presisi ──
+        band           = 0.012   # ±1.2% tolerance band
+        pct_vs_e20     = (price - ema20) / ema20 * 100
+        above_e20_any  = price > ema20 * (1 - band)   # dalam band EMA20
+        above_e20_clear= price > ema20 * (1 + band)   # jelas di atas
+        above_e55      = price > ema55
+        recovering     = chg > 0.3    # hari ini naik = lagi recovery
+        bearish_confirm= chg < -0.3 and not above_e20_any  # turun + jelas di bawah
+
+        if above_e20_clear and above_e55:
+            regime = "GREEN"
+            detail = f"IHSG {price:,.0f} > EMA20 & EMA55 → Bullish ✅ ({pct_vs_e20:+.1f}% vs EMA20)"
+        elif above_e20_any and above_e55:
+            regime = "GREEN"
+            detail = f"IHSG {price:,.0f} dekat EMA20({ema20:,.0f}) & > EMA55 → Bullish"
+        elif above_e20_any and not above_e55:
+            regime = "SIDEWAYS"
+            detail = f"IHSG {price:,.0f} > EMA20 tapi < EMA55({ema55:,.0f}) → Sideways"
+        elif not above_e20_any and recovering:
+            # Di bawah EMA20 TAPI hari ini naik = recovery → SIDEWAYS bukan RED
+            regime = "SIDEWAYS"
+            detail = f"IHSG {price:,.0f} recovery {chg:+.2f}% (EMA20={ema20:,.0f}, gap {pct_vs_e20:+.1f}%)"
+        elif bearish_confirm:
+            regime = "RED"
+            detail = f"IHSG {price:,.0f} < EMA20({ema20:,.0f}) {pct_vs_e20:+.1f}% + turun {chg:.2f}% → Bearish"
         else:
-            return ("SIDEWAYS", price, ema20, ema55, f"IHSG {price:,.0f} antara EMA20-EMA55", chg)
-    except:
-        return ("UNKNOWN", 0, 0, 0, "IHSG tidak tersedia — manual mode", 0.0)
+            regime = "SIDEWAYS"
+            detail = f"IHSG {price:,.0f} sedikit < EMA20({ema20:,.0f}) {pct_vs_e20:+.1f}% → Sideways"
+
+        return (regime, price, ema20, ema55, detail, chg)
+    except Exception as e:
+        return ("UNKNOWN", 0, 0, 0, f"IHSG error: {str(e)[:40]}", 0.0)
 
 def get_regime_config(regime):
     return {
@@ -244,10 +332,10 @@ def get_regime_config(regime):
             "desc": "Market bearish. Fokus reversal oversold, filter ketat."
         },
         "GREEN": {
-            "mode": "Bagger 💎", "min_score": 4, "min_rvol": 2.0, "sl_mult": 0.8,
-            "label": "🟢 MARKET HIJAU — Wyckoff Bagger Hunt, Score ≥ 4",
+            "mode": "Bagger 💎", "min_score": 4, "min_rvol": 1.5, "sl_mult": 0.8,
+            "label": "🟢 MARKET HIJAU — Wyckoff Bagger Hunt (Daily TF)",
             "color": "#00ff88",
-            "desc": "Market bullish. Cari akumulasi Wyckoff + breakout bagger. RVOL ≥ 2x."
+            "desc": "Market bullish. Cari akumulasi Wyckoff di chart harian. RVOL ≥ 1.5x."
         },
         "SIDEWAYS": {
             "mode": "Scalping ⚡", "min_score": 4, "min_rvol": 2.0, "sl_mult": 0.7,
@@ -264,8 +352,9 @@ def get_regime_config(regime):
     }.get(regime, {"mode":"Scalping ⚡","min_score":4,"min_rvol":1.5,"sl_mult":0.8,
                    "label":"⚪ UNKNOWN","color":"#4a5568","desc":""})
 
+
 # ════════════════════════════════════════════════════
-#  INDICATORS — identical Theta Turbo v5
+#  INDICATORS
 # ════════════════════════════════════════════════════
 def ema(s, n): return s.ewm(span=n, adjust=False).mean()
 
@@ -291,8 +380,10 @@ def vwap(df):
     tp = (df['High']+df['Low']+df['Close'])/3
     return (tp*df['Volume']).cumsum()/df['Volume'].cumsum()
 
-def apply_intraday_indicators(df):
-    if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.droplevel(1)
+def apply_indicators(df):
+    """Universal indicator function — works for both 15m and Daily."""
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.droplevel(-1)
     df['EMA9']  = ema(df['Close'],9);  df['EMA21'] = ema(df['Close'],21)
     df['EMA50'] = ema(df['Close'],50); df['EMA200']= ema(df['Close'],200)
     df['RSI'], df['RSI_EMA'] = rsi_smooth(df['Close'],14,3)
@@ -300,26 +391,32 @@ def apply_intraday_indicators(df):
     df['MACD'], df['MACD_Sig'], df['MACD_Hist'] = macd(df['Close'])
     try:    df['VWAP'] = vwap(df)
     except: df['VWAP'] = df['Close']
-    df['BB_mid']  = df['Close'].rolling(20).mean()
-    df['BB_std']  = df['Close'].rolling(20).std()
-    df['BB_upper']= df['BB_mid']+2*df['BB_std']; df['BB_lower']= df['BB_mid']-2*df['BB_std']
-    df['BB_pct']  = (df['Close']-df['BB_lower'])/(df['BB_upper']-df['BB_lower'])
-    df['AvgVol']  = df['Volume'].rolling(20).mean()
-    df['RVOL']    = df['Volume']/df['AvgVol']
-    df['NetVol']  = np.where(df['Close']>=df['Open'],df['Volume'],-df['Volume'])
-    df['NetVol3'] = pd.Series(df['NetVol'],index=df.index).rolling(3).sum()
-    df['NetVol8'] = pd.Series(df['NetVol'],index=df.index).rolling(8).sum()
-    df['VolSpike']= df['RVOL']>2.5
-    df['Body']    = (df['Close']-df['Open']).abs()
+    df['BB_mid']   = df['Close'].rolling(20).mean()
+    df['BB_std']   = df['Close'].rolling(20).std()
+    df['BB_upper'] = df['BB_mid']+2*df['BB_std']
+    df['BB_lower'] = df['BB_mid']-2*df['BB_std']
+    df['BB_pct']   = (df['Close']-df['BB_lower'])/(df['BB_upper']-df['BB_lower'])
+    df['AvgVol']   = df['Volume'].rolling(20).mean()
+    df['RVOL']     = df['Volume']/df['AvgVol'].replace(0, np.nan)
+    df['NetVol']   = np.where(df['Close']>=df['Open'],df['Volume'],-df['Volume'])
+    df['NetVol3']  = pd.Series(df['NetVol'],index=df.index).rolling(3).sum()
+    df['NetVol8']  = pd.Series(df['NetVol'],index=df.index).rolling(8).sum()
+    df['VolSpike'] = df['RVOL']>2.5
+    df['Body']     = (df['Close']-df['Open']).abs()
     df['BodyRatio']= df['Body']/(df['High']-df['Low']).replace(0,np.nan)
-    df['BullBar'] = (df['Close']>df['Open'])&(df['BodyRatio']>0.5)
-    df['ROC3']    = df['Close'].pct_change(3); df['ROC8'] = df['Close'].pct_change(8)
+    df['BullBar']  = (df['Close']>df['Open'])&(df['BodyRatio']>0.5)
+    df['ROC3']     = df['Close'].pct_change(3)
+    df['ROC8']     = df['Close'].pct_change(8)
     df['HH']= df['High']>df['High'].shift(1);  df['HL']= df['Low']>df['Low'].shift(1)
     df['LL']= df['Low']<df['Low'].shift(1);    df['LH']= df['High']<df['High'].shift(1)
-    tr = pd.concat([df['High']-df['Low'],(df['High']-df['Close'].shift()).abs(),
-                    (df['Low']-df['Close'].shift()).abs()],axis=1).max(axis=1)
+    tr = pd.concat([df['High']-df['Low'],
+                    (df['High']-df['Close'].shift()).abs(),
+                    (df['Low'] -df['Close'].shift()).abs()],axis=1).max(axis=1)
     df['ATR'] = tr.rolling(14).mean()
     return df
+
+# Legacy alias
+apply_intraday_indicators = apply_indicators
 
 # ════════════════════════════════════════════════════
 #  SCORING — Scalping, Momentum, Reversal
@@ -331,7 +428,7 @@ def score_scalping(r, p, p2):
     if r['Close']>r['VWAP']:              score+=1;   reasons.append("Above VWAP")
     if r['MACD_Hist']>0 and r['MACD_Hist']>float(p['MACD_Hist']):
         score+=1.5; reasons.append("MACD hist expanding ✦")
-        if p2 is not None and float(p['MACD_Hist'])>float(p2['MACD_Hist']): score+=0.3; reasons.append("MACD 3 bar rising")
+        if p2 is not None and float(p['MACD_Hist'])>float(p2['MACD_Hist']): score+=0.3
     elif r['MACD_Hist']>0: score+=0.5; reasons.append("MACD hist +")
     rsi_e=float(r['RSI_EMA'])
     if 52<rsi_e<68:  score+=0.8; reasons.append(f"RSI-EMA={rsi_e:.1f}")
@@ -394,27 +491,24 @@ def score_reversal(r, p, p2):
     if float(r['BodyRatio'])>0.75 and float(r['Close'])<float(r['Open']): score-=0.8; reasons.append("⚠️ Bearish bar kuat")
     return max(0,min(6,round(score,1))), reasons, {}
 
+
 # ════════════════════════════════════════════════════
-#  BAGGER DETECTOR — Wyckoff Accumulation Edition
-#
-#  3 Layer Logic:
-#  ① Phase A-B  : Sideways + Dry Volume + Stealth Net Buy
-#  ② Spring     : New Low → V-Shape Recovery (Shakeout)
-#  ③ Phase D    : RVOL Surge + Breakout + Thick Body
-#
-#  Deteksi sedini mungkin — masuk sebelum ritel sadar.
+#  BAGGER DETECTOR — Wyckoff · DAILY TIMEFRAME
+#  Daily TF jauh lebih presisi untuk Wyckoff pattern:
+#  - Sideways 20 bar = ~1 bulan akumulasi nyata
+#  - Dry vol 5 bar = 1 minggu sepi = bandar nyicil
+#  - Spring/breakout lebih valid di daily
 # ════════════════════════════════════════════════════
 def score_bagger(r, p, p2, df_full):
-    score  = 0; reasons = []
-    close  = float(r['Close'])
-    e9     = float(r['EMA9']);  e21  = float(r['EMA21'])
-    e50    = float(r['EMA50']); e200 = float(r['EMA200'])
-    rvol   = float(r['RVOL'])
-    rsi_e  = float(r['RSI_EMA'])
+    score=0; reasons=[]
+    close = float(r['Close'])
+    e9    = float(r['EMA9']);  e21  = float(r['EMA21'])
+    e50   = float(r['EMA50']); e200 = float(r['EMA200'])
+    rvol  = float(r['RVOL'])
+    rsi_e = float(r['RSI_EMA'])
     wyckoff_phase = "SCANNING"
 
-    # ① PHASE A-B — SIDEWAYS + DRY VOLUME
-    # Bandar nyicil diam-diam, harga gak kemana-mana
+    # ① PHASE A-B — SIDEWAYS + DRY VOLUME (Daily: 20 hari = ~1 bulan)
     is_sideways = False
     range_high  = close * 1.05; range_low = close * 0.95
     sideways_bars = min(20, len(df_full) - 2)
@@ -424,15 +518,16 @@ def score_bagger(r, p, p2, df_full):
         range_high = float(r_highs.max())
         range_low  = float(r_lows.min())
         range_pct  = (range_high - range_low) / max(range_low, 0.01) * 100
-        is_sideways = range_pct < 8.0
+        # Daily: threshold sedikit lebih longgar (10% vs 8% di 15m)
+        is_sideways = range_pct < 10.0
         if is_sideways:
-            tightness_bonus = max(0, (8.0 - range_pct) / 8.0)
+            tightness_bonus = max(0, (10.0 - range_pct) / 10.0)
             score += 1.0 + tightness_bonus * 0.5
-            reasons.append(f"Sideways {range_pct:.1f}% ({sideways_bars}B) ✦")
+            reasons.append(f"Sideways {range_pct:.1f}% ({sideways_bars} hari) ✦")
             wyckoff_phase = "A-B"
     except: pass
 
-    # Dry Volume: 5 bar terakhir vs MA20
+    # Dry Volume: 5 hari terakhir vs MA20 (Daily: 5 hari = 1 minggu)
     try:
         vol_ma20  = float(df_full['AvgVol'].iloc[-1])
         vol_last5 = float(df_full['Volume'].iloc[-6:-1].mean())
@@ -447,52 +542,49 @@ def score_bagger(r, p, p2, df_full):
             score += 0.6; reasons.append(f"Vol below avg {dry_ratio:.2f}x")
     except: pass
 
-    # Stealth Net Buy — proxy broker summary
-    # Harga diam tapi net buy konsisten = bandar nyicil
+    # Stealth Net Buy (Daily: 10 hari = 2 minggu konsisten)
     try:
         if len(df_full) >= 12:
             netvols_10   = [float(df_full['NetVol'].iloc[i]) for i in range(-11, -1)]
             net_positive = sum(1 for v in netvols_10 if v > 0)
             net_ratio    = net_positive / 10
             if net_ratio >= 0.7 and is_sideways:
-                score += 1.5; reasons.append(f"Stealth net buy {net_positive}/10 bars ✦✦")
+                score += 1.5; reasons.append(f"Stealth net buy {net_positive}/10 hari ✦✦")
             elif net_ratio >= 0.6:
-                score += 0.8; reasons.append(f"Net buy {net_positive}/10 bars")
+                score += 0.8; reasons.append(f"Net buy {net_positive}/10 hari")
             elif net_ratio >= 0.5:
                 score += 0.4
     except:
-        nv3 = float(r['NetVol3']); nv8 = float(r['NetVol8'])
+        nv3=float(r['NetVol3']); nv8=float(r['NetVol8'])
         if nv3>0 and nv8>0: score+=0.8; reasons.append("Net buyer sustained ✦")
-        elif nv3>0:          score+=0.3; reasons.append("Net buyer 3 bar")
+        elif nv3>0:          score+=0.3
 
-    # BB Squeeze selama sideways
+    # BB Squeeze (Daily: squeeze selama berminggu-minggu = valid banget)
     try:
         bb_curr  = float(r['BB_std'])
         bb_avg10 = float(df_full['BB_std'].iloc[-11:-1].mean())
         sq_ratio = bb_curr / max(bb_avg10, 0.0001)
         if sq_ratio < 0.7 and is_sideways:
-            score += 1.5; reasons.append(f"BB squeeze extreme {sq_ratio:.2f}x ✦✦")
+            score += 1.5; reasons.append(f"BB squeeze {sq_ratio:.2f}x ✦✦")
         elif sq_ratio < 0.85:
             score += 0.8; reasons.append(f"BB squeeze {sq_ratio:.2f}x")
     except: pass
 
-    # ② SPRING / SHAKEOUT DETECTION
-    # Harga jebol support → rebound cepat = jebak ritel
+    # ② SPRING / SHAKEOUT (Daily: lebih valid, bukan noise 15m)
     spring_detected = False
     try:
         lookback_sp = min(15, len(df_full) - 3)
         prior_lows  = df_full['Low'].iloc[-lookback_sp-2:-2]
         support     = float(prior_lows.min())
-        bar_low     = float(r['Low']); bar_close = float(r['Close']); bar_high = float(r['High'])
+        bar_low=float(r['Low']); bar_close=float(r['Close']); bar_high=float(r['High'])
         is_spring   = bar_low < support and bar_close > support
         if is_spring:
             recovery_strength = (bar_close - bar_low) / max(bar_high - bar_low, 0.0001)
-            spring_vol_ok     = rvol > 1.2
-            if recovery_strength > 0.7 and spring_vol_ok:
-                score += 3.0; reasons.append(f"🔥 SPRING! Support break → rebound {recovery_strength:.0%} ✦✦✦")
+            if recovery_strength > 0.7 and rvol > 1.2:
+                score += 3.0; reasons.append(f"🔥 SPRING! {recovery_strength:.0%} rebound ✦✦✦")
                 wyckoff_phase = "SPRING ⚡"; spring_detected = True
             elif recovery_strength > 0.5:
-                score += 1.8; reasons.append(f"Spring pattern (recovery {recovery_strength:.0%}) ✦✦")
+                score += 1.8; reasons.append(f"Spring ({recovery_strength:.0%} recovery) ✦✦")
                 wyckoff_phase = "SPRING"; spring_detected = True
         is_post_spring = (float(p['Low']) < support and
                           float(p['Close']) > support and bar_close > float(p['Close']))
@@ -501,60 +593,56 @@ def score_bagger(r, p, p2, df_full):
             wyckoff_phase = "POST-SPRING"; spring_detected = True
     except: pass
 
-    # ③ PHASE D — RVOL SURGE + BREAKOUT
-    # Konfirmasi entry aman — bandar gas-in
+    # ③ PHASE D — RVOL SURGE + BREAKOUT (Daily breakout = SANGAT valid)
     try:
         above_resistance = close > range_high * 0.998
         thick_body       = float(r['BodyRatio']) > 0.55
         bull_bar_flag    = float(r['Close']) > float(r['Open'])
-        if rvol > 4.0 and above_resistance and thick_body and bull_bar_flag:
-            score += 3.0; reasons.append(f"🚀 PHASE D! RVOL={rvol:.1f}x breakout thick body ✦✦✦")
+        if rvol > 3.0 and above_resistance and thick_body and bull_bar_flag:
+            score += 3.0; reasons.append(f"🚀 PHASE D! RVOL={rvol:.1f}x daily breakout ✦✦✦")
             wyckoff_phase = "PHASE D 🚀"
-        elif rvol > 3.0 and above_resistance and bull_bar_flag:
-            score += 2.2; reasons.append(f"Breakout confirmed RVOL={rvol:.1f}x ✦✦")
+        elif rvol > 2.0 and above_resistance and bull_bar_flag:
+            score += 2.2; reasons.append(f"Breakout daily RVOL={rvol:.1f}x ✦✦")
             wyckoff_phase = "BREAKOUT ✦"
-        elif rvol > 2.0 and above_resistance:
+        elif rvol > 1.5 and above_resistance:
             score += 1.5; reasons.append(f"Breakout attempt RVOL={rvol:.1f}x")
         elif above_resistance:
-            score += 0.8; reasons.append("Above resistance (low vol)")
+            score += 0.8; reasons.append("Above resistance")
         else:
-            if rvol>4.0:   score+=1.5; reasons.append(f"RVOL={rvol:.1f}x MASSIVE 🔥🔥")
-            elif rvol>3.0: score+=1.0; reasons.append(f"RVOL={rvol:.1f}x SURGE 🔥")
-            elif rvol>2.0: score+=0.5; reasons.append(f"RVOL={rvol:.1f}x")
-            elif rvol<1.3 and wyckoff_phase not in ["A-B AKUMULASI","SPRING","POST-SPRING"]:
+            if rvol>3.0:   score+=1.2; reasons.append(f"RVOL={rvol:.1f}x SURGE 🔥")
+            elif rvol>2.0: score+=0.8; reasons.append(f"RVOL={rvol:.1f}x")
+            elif rvol>1.5: score+=0.4; reasons.append(f"RVOL={rvol:.1f}x")
+            elif rvol<1.0 and wyckoff_phase not in ["A-B AKUMULASI","SPRING","POST-SPRING"]:
                 score -= 0.5
     except:
-        if rvol>4.0:   score+=1.5; reasons.append(f"RVOL={rvol:.1f}x MASSIVE 🔥🔥")
-        elif rvol>3.0: score+=1.0; reasons.append(f"RVOL={rvol:.1f}x SURGE 🔥")
-        elif rvol>2.0: score+=0.5; reasons.append(f"RVOL={rvol:.1f}x")
+        if rvol>3.0:   score+=1.2; reasons.append(f"RVOL={rvol:.1f}x SURGE 🔥")
+        elif rvol>2.0: score+=0.8; reasons.append(f"RVOL={rvol:.1f}x")
+        elif rvol>1.5: score+=0.4
 
     # EMA Structure
-    if e9>e21>e50>e200:     score+=1.5; reasons.append("EMA golden stack ✦✦")
-    elif e9>e21>e50:         score+=1.0; reasons.append("EMA stack ▲")
-    elif e9>e21:             score+=0.4
+    if e9>e21>e50>e200:  score+=1.5; reasons.append("EMA golden stack ✦✦")
+    elif e9>e21>e50:     score+=1.0; reasons.append("EMA stack ▲")
+    elif e9>e21:         score+=0.4
     elif is_sideways and wyckoff_phase in ["A-B AKUMULASI","SPRING","POST-SPRING"]:
-        score+=0.2; reasons.append("EMA flat (accum phase OK)")
+        score+=0.2
 
-    # RSI — konteks beda per fase
+    # RSI per fase
     if wyckoff_phase in ["A-B","A-B AKUMULASI","SPRING","POST-SPRING"]:
-        # Saat akumulasi, RSI rendah itu BAGUS
-        if 25<=rsi_e<=52:   score+=1.0; reasons.append(f"RSI-EMA={rsi_e:.1f} accum zone ✓")
-        elif rsi_e<25:       score+=0.6; reasons.append(f"RSI-EMA={rsi_e:.1f} extreme OS (load zone)")
-        elif rsi_e>65:       score-=0.3
+        if 25<=rsi_e<=52:  score+=1.0; reasons.append(f"RSI-EMA={rsi_e:.1f} accum zone ✓")
+        elif rsi_e<25:     score+=0.6; reasons.append(f"RSI-EMA={rsi_e:.1f} extreme OS")
+        elif rsi_e>65:     score-=0.3
     else:
-        if 52<rsi_e<72:     score+=1.0; reasons.append(f"RSI-EMA={rsi_e:.1f} momentum zone")
-        elif rsi_e>=72:     score-=0.5; reasons.append(f"⚠️ RSI OB {rsi_e:.1f}")
-        elif rsi_e<40:      score-=0.3
+        if 52<rsi_e<72:   score+=1.0; reasons.append(f"RSI-EMA={rsi_e:.1f} momentum")
+        elif rsi_e>=72:   score-=0.5; reasons.append(f"⚠️ RSI OB {rsi_e:.1f}")
+        elif rsi_e<40:    score-=0.3
 
-    # VWAP & EMA200 floor
     if close>float(r['VWAP']): score+=0.5; reasons.append("Above VWAP")
-    if close<e200*0.88:         score-=1.0
+    if e200>0 and close<e200*0.88: score-=1.0
 
-    # Consecutive bull bars
     try:
         if len(df_full)>=4:
             bc=sum(1 for i in range(-3,0) if float(df_full['Close'].iloc[i])>float(df_full['Open'].iloc[i]))
-            if bc==3:   score+=0.8; reasons.append("3x consecutive bull bars")
+            if bc==3:   score+=0.8; reasons.append("3x consecutive bull bar")
             elif bc==2: score+=0.3
     except: pass
 
@@ -564,7 +652,7 @@ def score_bagger(r, p, p2, df_full):
     return max(0, min(6, round(score, 1))), reasons, {"wyckoff_phase": wyckoff_phase}
 
 # ════════════════════════════════════════════════════
-#  SIGNAL LABEL & CARD CLASS
+#  SIGNAL & CARD CLASS
 # ════════════════════════════════════════════════════
 def get_signal(score, mode):
     t = {
@@ -578,11 +666,12 @@ def get_signal(score, mode):
     return "WAIT"
 
 def get_card_class(signal):
-    if "BAGGER" in signal:                             return "bagger"
-    if "GACOR" in signal or "REVERSAL" in signal:     return "gacor"
-    if "KANDIDAT" in signal or "POTENSIAL" in signal: return "potensial"
-    if "WATCH" in signal:                             return "watch"
+    if "BAGGER" in signal or "KANDIDAT" in signal: return "bagger"
+    if "GACOR"  in signal or "REVERSAL" in signal: return "gacor"
+    if "POTENSIAL" in signal:                      return "potensial"
+    if "WATCH"  in signal:                         return "watch"
     return ""
+
 
 # ════════════════════════════════════════════════════
 #  BSJP SCORING
@@ -624,18 +713,18 @@ def send_telegram(results_top, source="Scanner"):
            f"⏰ `{now.strftime('%H:%M:%S')} WIB` · `{now.strftime('%d %b %Y')}`\n{sep}\n")
     body = ""
     for r in results_top[:5]:
-        sig  = r.get('Signal','-')
-        em   = "💎" if "BAGGER" in sig else ("🏆" if ("GACOR" in sig or "REVERSAL" in sig) else ("🔥" if "POTENSIAL" in sig else "👀"))
-        te   = "📈" if "▲" in r.get('Trend','') else ("📉" if "▼" in r.get('Trend','') else "➡️")
-        bar  = "█"*int(r['Score'])+"░"*(6-int(r['Score']))
-        body += (f"\n{em} *{r['Ticker']}*  `{sig}`\n"
+        sig = r.get('Signal','-')
+        em  = "💎" if "BAGGER" in sig else ("🏆" if ("GACOR" in sig or "REVERSAL" in sig) else ("🔥" if "POTENSIAL" in sig else "👀"))
+        te  = "📈" if "▲" in r.get('Trend','') else ("📉" if "▼" in r.get('Trend','') else "➡️")
+        bar = "█"*int(r['Score'])+"░"*(6-int(r['Score']))
+        tf_label = " [D1]" if r.get("TF","")=="Daily" else " [15M]"
+        body += (f"\n{em} *{r['Ticker']}*  `{sig}`{tf_label}\n"
                  f"   💰 Price: `{r['Price']:,}` {te}\n"
                  f"   📊 Score: `[{bar}] {r['Score']}/6`\n"
-                 f"   📈 RSI-EMA: `{r.get('RSI-EMA',0)}` | STOCH: `{r.get('Stoch K',0)}`\n"
-                 f"   🌊 RVOL: `{r.get('RVOL',0)}x` | MACD: `{r.get('MACD Hist',0)}`\n"
+                 f"   📈 RSI-EMA: `{r.get('RSI-EMA',0)}` | RVOL: `{r.get('RVOL',0)}x`\n"
                  f"   🎯 TP: `{r['TP']:,}` | 🛑 SL: `{r['SL']:,}` | R:R `{r['R:R']}`\n"
                  f"   💡 _{r.get('Reasons','')[:60]}_\n")
-    footer = f"\n{sep}\n⚡ _Theta Turbo v5 · Wyckoff Bagger · 15M Intraday_\n⚠️ _BUKAN saran investasi. DYOR!_"
+    footer = f"\n{sep}\n⚡ _Theta Turbo v5.2 · Wyckoff Bagger Daily · IDX_\n⚠️ _BUKAN saran investasi. DYOR!_"
     try:
         requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage",
                       data={"chat_id":CHAT_ID,"text":hdr+body+footer,"parse_mode":"Markdown"},
@@ -643,25 +732,62 @@ def send_telegram(results_top, source="Scanner"):
     except: pass
 
 # ════════════════════════════════════════════════════
-#  DATA FETCH
+#  DATA FETCH — FIXED (robust yfinance multi-version)
 # ════════════════════════════════════════════════════
 @st.cache_data(ttl=300)
 def fetch_intraday(tickers, chunk=25):
+    """
+    Fetch 15m intraday data.
+    FIX: _yf_extract() handles semua versi yfinance MultiIndex.
+    """
     all_dfs = {}
     for i in range(0, len(tickers), chunk):
         batch = tickers[i:i+chunk]
         try:
-            raw = yf.download(batch, period="5d", interval="15m",
-                              group_by='ticker', progress=False,
-                              threads=True, auto_adjust=True)
+            raw = yf.download(
+                list(batch), period="5d", interval="15m",
+                group_by='ticker', progress=False,
+                threads=True, auto_adjust=True
+            )
             for t in batch:
                 try:
-                    df = raw[t].dropna() if len(batch)>1 else raw.dropna()
-                    if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.droplevel(1)
-                    if len(df) >= 50: all_dfs[t] = df
-                except: pass
-        except: pass
-        time.sleep(0.5)
+                    df = _yf_extract(raw, t, len(batch))
+                    if df is not None and len(df) >= 50:
+                        all_dfs[t] = df
+                except:
+                    pass
+        except:
+            pass
+        time.sleep(0.3)
+    return all_dfs
+
+@st.cache_data(ttl=600)   # 10 menit — daily data lebih stabil
+def fetch_daily_bagger(tickers, chunk=30):
+    """
+    Fetch 60-hari data DAILY untuk Wyckoff Bagger detection.
+    Daily TF = pattern lebih valid, tidak noise seperti 15m.
+    chunk=30 karena daily jauh lebih ringan dari 15m.
+    """
+    all_dfs = {}
+    for i in range(0, len(tickers), chunk):
+        batch = tickers[i:i+chunk]
+        try:
+            raw = yf.download(
+                list(batch), period="60d", interval="1d",
+                group_by='ticker', progress=False,
+                threads=True, auto_adjust=True
+            )
+            for t in batch:
+                try:
+                    df = _yf_extract(raw, t, len(batch))
+                    # Daily: min 20 bar (1 bulan trading = 20-22 hari)
+                    if df is not None and len(df) >= 20:
+                        all_dfs[t] = df
+                except:
+                    pass
+        except:
+            pass
+        time.sleep(0.2)
     return all_dfs
 
 # ════════════════════════════════════════════════════
@@ -676,10 +802,11 @@ def calc_pivot_points(high, low, close):
 @st.cache_data(ttl=3600)
 def fetch_pivot_data(ticker_yf):
     try:
-        df = yf.download(ticker_yf, period="5d", interval="1d",
-                         progress=False, auto_adjust=True, threads=False)
-        if df is None or len(df)<2: return None
-        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.droplevel(1)
+        raw = yf.download(ticker_yf, period="5d", interval="1d",
+                          progress=False, auto_adjust=True, threads=False)
+        if raw is None or raw.empty or len(raw) < 2: return None
+        df = _yf_extract(raw, ticker_yf, 1)
+        if df is None or len(df) < 2: return None
         prev = df.iloc[-2]
         return calc_pivot_points(float(prev["High"]),float(prev["Low"]),float(prev["Close"]))
     except: return None
@@ -702,12 +829,10 @@ def fetch_mtf_data(ticker_yf):
     result = {}
     for interval,period,key in [("15m","3d","M15"),("1h","10d","H1"),("1d","60d","D1")]:
         try:
-            df = yf.download(ticker_yf,period=period,interval=interval,
-                             progress=False,auto_adjust=True,threads=False)
-            if df is not None and not df.empty:
-                if isinstance(df.columns,pd.MultiIndex): df.columns=df.columns.droplevel(1)
-                df=df.dropna()
-                if len(df)>=20: result[key]=df
+            raw = yf.download(ticker_yf, period=period, interval=interval,
+                              progress=False, auto_adjust=True, threads=False)
+            df = _yf_extract(raw, ticker_yf, 1)
+            if df is not None and len(df) >= 20: result[key] = df
         except: pass
     return result
 
@@ -715,7 +840,7 @@ def score_mtf(ticker_yf, mode="Scalping ⚡"):
     mtf=fetch_mtf_data(ticker_yf); scores={}
     for tf_key,df in mtf.items():
         try:
-            df=apply_intraday_indicators(df.copy())
+            df=apply_indicators(df.copy())
             if len(df)<3: continue
             r=df.iloc[-1]; p=df.iloc[-2]; p2=df.iloc[-3]
             if mode=="Scalping ⚡":   sc,_,_=score_scalping(r,p,p2)
@@ -730,13 +855,14 @@ def mtf_alignment(scores):
     if not scores: return "No Data","#4a5568",0
     vals=list(scores.values()); avg=sum(vals)/len(vals)
     bc=sum(1 for v in vals if v>=4)
-    if bc==len(vals):   return "FULL ALIGN 🔥","#00ff88",avg
-    elif bc>=2:         return "PARTIAL ⚡","#ffb700",avg
-    elif bc==1:         return "MIXED ⚠️","#ff7b00",avg
-    else:               return "NO ALIGN ❌","#ff3d5a",avg
+    if bc==len(vals):  return "FULL ALIGN 🔥","#00ff88",avg
+    elif bc>=2:        return "PARTIAL ⚡","#ffb700",avg
+    elif bc==1:        return "MIXED ⚠️","#ff7b00",avg
+    else:              return "NO ALIGN ❌","#ff3d5a",avg
+
 
 # ════════════════════════════════════════════════════
-#  SEKTOR IDX
+#  SEKTOR, GAP UP, TRAILING STOP
 # ════════════════════════════════════════════════════
 SECTORS = {
     "Energi & Mining":    ["ADRO","BYAN","ITMG","PTBA","HRUM","DOID","GEMS","PGAS","ELSA","MEDC","ESSA","AKRA","RIGS","DSSA","MBAP","KKGI","MYOH","SMMT","BSSR","INDY"],
@@ -760,35 +886,30 @@ def fetch_sector_rotation(sector_stocks):
         for t in tickers_yf:
             tkr=t.replace(".JK","")
             try:
-                if len(tickers_yf)>1: df=raw[t].dropna()
-                else:
-                    df=raw.copy()
-                    if isinstance(df.columns,pd.MultiIndex): df.columns=df.columns.droplevel(1)
-                    df=df.dropna()
-                if len(df)<2: continue
+                df = _yf_extract(raw, t, len(tickers_yf))
+                if df is None or len(df)<2: continue
                 close=float(df["Close"].iloc[-1]); prev=float(df["Close"].iloc[-2])
-                chg=(close-prev)/prev*100; vol=float(df["Volume"].iloc[-1]); avg_v=float(df["Volume"].mean())
-                rvol=vol/avg_v if avg_v>0 else 1.0
+                chg=(close-prev)/prev*100; vol=float(df["Volume"].iloc[-1])
+                avg_v=float(df["Volume"].mean()); rvol=vol/avg_v if avg_v>0 else 1.0
                 results.append({"ticker":tkr,"close":close,"chg":chg,"rvol":round(rvol,2)})
             except: pass
     except: pass
     return results
 
 @st.cache_data(ttl=3600)
-def calc_sector_beta(sector_name,sector_stocks,lookback=20):
+def calc_sector_beta(sector_name, sector_stocks, lookback=20):
     try:
-        ihsg=yf.download("^JKSE",period="60d",interval="1d",progress=False,auto_adjust=True)
+        raw_ihsg=yf.download("^JKSE",period="60d",interval="1d",progress=False,auto_adjust=True)
+        ihsg = _yf_extract(raw_ihsg, "^JKSE", 1)
         if ihsg is None or len(ihsg)<lookback: return None
-        if isinstance(ihsg.columns,pd.MultiIndex): ihsg.columns=ihsg.columns.droplevel(1)
         ihsg_ret=ihsg["Close"].pct_change().dropna()
         tickers_yf=[s+".JK" for s in sector_stocks[:8]]
         raw=yf.download(tickers_yf,period="60d",interval="1d",group_by="ticker",progress=False,threads=True,auto_adjust=True)
         sec_rets=[]
         for t in tickers_yf:
             try:
-                if len(tickers_yf)>1: df=raw[t]["Close"].dropna()
-                else: df=raw["Close"].dropna()
-                sec_rets.append(df.pct_change().dropna())
+                df = _yf_extract(raw, t, len(tickers_yf))
+                if df is not None: sec_rets.append(df["Close"].pct_change().dropna())
             except: pass
         if not sec_rets: return None
         sec_avg=pd.concat(sec_rets,axis=1).mean(axis=1)
@@ -813,30 +934,23 @@ def get_beta_label(beta):
     elif beta<1.3: return "🟠 Aggressive","#ff7b00"
     else:          return "🔴 High Risk","#ff3d5a"
 
-# ════════════════════════════════════════════════════
-#  GAP UP SCANNER
-# ════════════════════════════════════════════════════
 @st.cache_data(ttl=300)
 def scan_gap_up(tickers_yf, min_gap_pct=0.5):
     results=[]
     for i in range(0,len(tickers_yf),30):
         batch=tickers_yf[i:i+30]
         try:
-            raw=yf.download(batch,period="5d",interval="1d",
+            raw=yf.download(list(batch),period="5d",interval="1d",
                             group_by="ticker",progress=False,threads=True,auto_adjust=True)
             for t in batch:
                 tkr=t.replace(".JK","")
                 try:
-                    if len(batch)>1: df=raw[t].dropna()
-                    else:
-                        df=raw.copy()
-                        if isinstance(df.columns,pd.MultiIndex): df.columns=df.columns.droplevel(1)
-                        df=df.dropna()
-                    if len(df)<3: continue
+                    df = _yf_extract(raw, t, len(batch))
+                    if df is None or len(df)<3: continue
                     today=df.iloc[-1]; prev=df.iloc[-2]
                     close=float(today["Close"]); high_t=float(today["High"]); low_t=float(today["Low"])
-                    high_p=float(prev["High"]); vol=float(today["Volume"]); avg_vol=float(df["Volume"].mean())
-                    rvol=vol/avg_vol if avg_vol>0 else 1.0
+                    high_p=float(prev["High"]); vol=float(today["Volume"])
+                    avg_vol=float(df["Volume"].mean()); rvol=vol/avg_vol if avg_vol>0 else 1.0
                     gap_score=0; reasons=[]
                     if close>high_p:
                         gap_pct=(close-high_p)/high_p*100
@@ -860,20 +974,19 @@ def scan_gap_up(tickers_yf, min_gap_pct=0.5):
                                     "Reasons":" · ".join(reasons[:3])})
                 except: pass
         except: pass
-        time.sleep(0.3)
+        time.sleep(0.2)
     return sorted(results,key=lambda x:x["Gap Score"],reverse=True)
 
-# ════════════════════════════════════════════════════
-#  TRAILING STOP ENGINE
-# ════════════════════════════════════════════════════
 def calc_trailing_stop(entry,current,atr,method="ATR",atr_mult=2.0,pct=3.0):
-    if method=="ATR":   trail_dist=atr*atr_mult; stop_price=current-trail_dist
+    if method=="ATR":      trail_dist=atr*atr_mult; stop_price=current-trail_dist
     elif method=="Persen": trail_dist=current*(pct/100); stop_price=current*(1-pct/100)
-    else:               trail_dist=atr*1.5; stop_price=current-trail_dist
-    profit_pct=(current-entry)/entry*100; locked_pct=(stop_price-entry)/entry*100 if stop_price>entry else 0
+    else:                  trail_dist=atr*1.5; stop_price=current-trail_dist
+    profit_pct=(current-entry)/entry*100
+    locked_pct=(stop_price-entry)/entry*100 if stop_price>entry else 0
     return {"stop":round(stop_price,0),"distance":round(trail_dist,0),
             "profit_float":round(profit_pct,2),"profit_locked":round(locked_pct,2),
             "is_profitable":stop_price>entry}
+
 
 # ════════════════════════════════════════════════════
 #  HEADER
@@ -888,7 +1001,7 @@ st.markdown(f"""
 <div class="tt-header">
   <div>
     <div class="tt-logo">🔥 THETA TURBO</div>
-    <div class="tt-sub">Intraday 15M · Wyckoff Bagger · Auto Regime · v5.2</div>
+    <div class="tt-sub">Intraday 15M + Daily Bagger · Wyckoff · Auto Regime · v5.2</div>
   </div>
   <div class="live-badge"><div class="live-dot"></div>LIVE {now_jkt.strftime("%H:%M:%S")} WIB</div>
 </div>""", unsafe_allow_html=True)
@@ -928,8 +1041,15 @@ with tab_scanner:
                 scan_mode = rcfg["mode"]
                 st.markdown(f'<div style="font-family:Space Mono,monospace;font-size:10px;padding:6px 10px;background:rgba(0,0,0,.3);border-radius:4px;color:{rcolor};">Auto: {scan_mode}</div>',unsafe_allow_html=True)
             else:
-                scan_mode = st.radio("Mode",["Scalping ⚡","Momentum 🚀","Reversal 🎯","Bagger 💎"],
-                                     label_visibility="collapsed",key="scan_mode_radio")
+                # Pakai last active mode sebagai default biar tidak reset ke Scalping
+                _prev = st.session_state.get("active_scan_mode","Scalping ⚡")
+                _opts = ["Scalping ⚡","Momentum 🚀","Reversal 🎯","Bagger 💎"]
+                _idx  = _opts.index(_prev) if _prev in _opts else 0
+                scan_mode = st.radio("Mode", _opts, index=_idx,
+                                     label_visibility="collapsed", key="scan_mode_radio")
+            # Persist ke session_state — penting untuk auto_trigger
+            st.session_state.active_scan_mode   = scan_mode
+            st.session_state.active_auto_regime = auto_regime
             tele_on = st.toggle("📡 Telegram Alert", value=True, key="tele_on")
         with sc2:
             st.markdown('<div class="settings-label">FILTER</div>',unsafe_allow_html=True)
@@ -939,14 +1059,16 @@ with tab_scanner:
                 st.caption(f"Auto: Score≥{min_score} · RVOL≥{vol_thresh}x")
             else:
                 min_score  = st.slider("Min Score (0-6)",0,6,4,key="msc")
-                vol_thresh = st.slider("Min RVOL Spike",1.0,5.0,1.5,0.1,key="vol")
+                vol_thresh = st.slider("Min RVOL",1.0,5.0,1.5,0.1,key="vol")
             min_turn = st.number_input("Min Turnover (M Rp)",value=500,step=100,key="trn")*1_000_000
         with sc3:
             st.markdown('<div class="settings-label">TAMPILAN</div>',unsafe_allow_html=True)
             view_mode  = st.radio("View",["Card View 🃏","Table View 📊"],label_visibility="collapsed",key="view_mode")
             quick_mode = st.toggle("⚡ Quick (200 saham)",value=False,key="quick_mode")
-            st.caption(f"🎯 Regime: {regime} · Mode: {scan_mode}")
-            st.caption(f"📊 {len(raw_stocks)} emiten tersedia")
+            is_bagger_mode = (scan_mode == "Bagger 💎")
+            if is_bagger_mode:
+                st.markdown('<div style="font-family:Space Mono,monospace;font-size:9px;color:#bf5fff;padding:4px 8px;background:rgba(191,95,255,.1);border-radius:4px;">📅 Bagger: Daily TF (60 hari)</div>',unsafe_allow_html=True)
+            st.caption(f"🎯 {regime} · {scan_mode} · {len(raw_stocks)} emiten")
 
     do_scan = st.button("🔥 MULAI SCAN SEKARANG",type="primary",use_container_width=True,key="btn_scan")
 
@@ -955,75 +1077,121 @@ with tab_scanner:
     if st.session_state.last_scan_time and not do_scan:
         if _now_check-st.session_state.last_scan_time>=300 and st.session_state.scan_results:
             do_scan=True; auto_triggered=True
+            # Pakai mode terakhir yang aktif — bukan default Scalping
+            scan_mode = st.session_state.get("active_scan_mode", scan_mode)
 
     if do_scan:
-        scan_list = stocks_yf[:200] if quick_mode else stocks_yf
-        prog_ph = st.empty()
-        with prog_ph.container():
-            label="🔄 AUTO-REFRESH" if auto_triggered else "🔥 SCANNING"
-            st.markdown(f'<div style="color:#ff7b00;font-family:Space Mono,monospace;font-size:12px;letter-spacing:1px;">{label} {len(scan_list)} saham ({scan_mode})...</div>',unsafe_allow_html=True)
-            pb = st.progress(0)
+        scan_list  = stocks_yf[:200] if quick_mode else stocks_yf
+        is_bagger  = (scan_mode == "Bagger 💎")
+        prog_ph    = st.empty()
+        pb         = st.progress(0)
+        tf_label   = "📅 DAILY (60 hari)" if is_bagger else "⚡ 15M INTRADAY"
+        label      = "🔄 AUTO-REFRESH" if auto_triggered else "🔥 SCANNING"
+
+        prog_ph.markdown(
+            f'<div style="color:#ff7b00;font-family:Space Mono,monospace;font-size:12px;">'
+            f'{label} {len(scan_list)} saham · {scan_mode} · {tf_label}</div>',
+            unsafe_allow_html=True)
+
         try:
-            data_dict=fetch_intraday(tuple(scan_list))
-            st.session_state.data_dict=data_dict
-            results=[]; tickers=list(data_dict.keys())
-            for i,ticker_yf in enumerate(tickers):
-                pb.progress((i+1)/max(len(tickers),1))
-                try:
-                    df=data_dict[ticker_yf].copy()
-                    if len(df)<55: continue
-                    df=apply_intraday_indicators(df)
-                    r=df.iloc[-1]; p=df.iloc[-2]; p2=df.iloc[-3] if len(df)>=3 else p
-                    close=float(r['Close']); vol=float(r['Volume'])
-                    turnover=close*vol; rvol=float(r['RVOL'])
-                    if turnover<min_turn or rvol<vol_thresh: continue
-                    if scan_mode=="Scalping ⚡":   sc,reasons,_=score_scalping(r,p,p2)
-                    elif scan_mode=="Momentum 🚀": sc,reasons,_=score_momentum(r,p,p2)
-                    elif scan_mode=="Bagger 💎":   sc,reasons,_=score_bagger(r,p,p2,df)
-                    else:                          sc,reasons,_=score_reversal(r,p,p2)
-                    if sc<min_score: continue
-                    sig=get_signal(sc,scan_mode)
-                    if sig=="WAIT": continue
-                    atr=float(r['ATR']); slm=rcfg.get("sl_mult",0.8)
-                    if scan_mode=="Scalping ⚡":   tp=close+1.5*atr; sl=close-slm*atr
-                    elif scan_mode=="Momentum 🚀": tp=close+2.0*atr; sl=close-slm*atr
-                    elif scan_mode=="Bagger 💎":   tp=close+3.0*atr; sl=close-1.0*atr
-                    else:                          tp=close+2.5*atr; sl=close-slm*atr
-                    rr=(tp-close)/max(close-sl,0.01)
-                    e9=float(r['EMA9']); e21=float(r['EMA21']); e50=float(r['EMA50'])
-                    trend="▲ UP" if e9>e21>e50 else("▼ DOWN" if e9<e21<e50 else"◆ SIDE")
-                    results.append({
-                        "Ticker":stock_map[ticker_yf],"Price":int(close),"Score":sc,"Signal":sig,"Trend":trend,
-                        "RSI-EMA":round(float(r['RSI_EMA']),1),"Stoch K":round(float(r['STOCH_K']),1),
-                        "Stoch D":round(float(r['STOCH_D']),1),"MACD Hist":round(float(r['MACD_Hist']),4),
-                        "RVOL":round(rvol,2),"BB%":round(float(r['BB_pct']),2),
-                        "ROC 3B%":round(float(r['ROC3'])*100,2),"VWAP":int(float(r['VWAP'])),
-                        "TP":int(tp),"SL":int(sl),"R:R":round(rr,1),
-                        "Turnover(M)":round(turnover/1e6,1),"Reasons":" · ".join(reasons),
-                        "_class":get_card_class(sig)
-                    })
-                except: continue
-            prog_ph.empty()
-            st.session_state.scan_results=results
-            st.session_state.last_scan_time=datetime.now(jakarta_tz).timestamp()
-            st.session_state.last_scan_mode=scan_mode
-            if tele_on and results:
-                if 'tt_last_sent' not in st.session_state: st.session_state.tt_last_sent=set()
-                df_tmp=pd.DataFrame(results).sort_values("Score",ascending=False)
-                cur_set=set(df_tmp['Ticker'].tolist()); new_alr=cur_set-st.session_state.tt_last_sent
-                if new_alr:
-                    top_new=df_tmp[df_tmp['Ticker'].isin(new_alr)].head(5).to_dict('records')
-                    if top_new: send_telegram(top_new)
-                    st.session_state.tt_last_sent.update(new_alr)
-                st.session_state.tt_last_sent=st.session_state.tt_last_sent&cur_set
+            # ── FETCH: pilih TF sesuai mode ──
+            if is_bagger:
+                data_dict = fetch_daily_bagger(tuple(scan_list))
+            else:
+                data_dict = fetch_intraday(tuple(scan_list))
+
+            st.session_state.data_dict = data_dict
+            n_fetched = len(data_dict)
+
+            if n_fetched == 0:
+                prog_ph.empty(); pb.empty()
+                st.warning(f"⚠️ Tidak ada data yang berhasil di-fetch. "
+                           f"Coba lagi atau kurangi jumlah saham.")
+            else:
+                prog_ph.markdown(
+                    f'<div style="color:#00ff88;font-family:Space Mono,monospace;font-size:11px;">'
+                    f'✅ {n_fetched} saham berhasil · Scoring {scan_mode}...</div>',
+                    unsafe_allow_html=True)
+
+                results=[]; tickers=list(data_dict.keys())
+                # Min bars: daily=20, intraday=55
+                min_bars = 20 if is_bagger else 55
+
+                for i,ticker_yf in enumerate(tickers):
+                    pb.progress((i+1)/max(len(tickers),1))
+                    try:
+                        df=data_dict[ticker_yf].copy()
+                        if len(df)<min_bars: continue
+                        df=apply_indicators(df)
+                        r=df.iloc[-1]; p=df.iloc[-2]; p2=df.iloc[-3] if len(df)>=3 else p
+                        close=float(r['Close']); vol=float(r['Volume'])
+                        turnover=close*vol; rvol=float(r['RVOL'])
+
+                        # Turnover filter: daily vol lebih besar, threshold sama (500M default)
+                        if turnover < min_turn or rvol < vol_thresh: continue
+
+                        # ── Scoring sesuai mode ──
+                        if scan_mode=="Scalping ⚡":   sc,reasons,_=score_scalping(r,p,p2)
+                        elif scan_mode=="Momentum 🚀": sc,reasons,_=score_momentum(r,p,p2)
+                        elif scan_mode=="Bagger 💎":   sc,reasons,_=score_bagger(r,p,p2,df)
+                        else:                          sc,reasons,_=score_reversal(r,p,p2)
+
+                        if sc<min_score: continue
+                        sig=get_signal(sc,scan_mode)
+                        if sig=="WAIT": continue
+
+                        atr=float(r['ATR']) if not np.isnan(float(r['ATR'])) else close*0.01
+                        slm=rcfg.get("sl_mult",0.8)
+                        if scan_mode=="Scalping ⚡":   tp=close+1.5*atr; sl=close-slm*atr
+                        elif scan_mode=="Momentum 🚀": tp=close+2.0*atr; sl=close-slm*atr
+                        elif scan_mode=="Bagger 💎":   tp=close+3.0*atr; sl=close-1.0*atr
+                        else:                          tp=close+2.5*atr; sl=close-slm*atr
+                        rr=(tp-close)/max(close-sl,0.01)
+
+                        e9=float(r['EMA9']); e21=float(r['EMA21']); e50=float(r['EMA50'])
+                        trend="▲ UP" if e9>e21>e50 else("▼ DOWN" if e9<e21<e50 else"◆ SIDE")
+                        gain_pct = float(r['ROC3'])*100
+
+                        results.append({
+                            "Ticker":stock_map.get(ticker_yf,ticker_yf.replace(".JK","")),
+                            "Price":int(close),"Score":sc,"Signal":sig,"Trend":trend,"TF":"Daily" if is_bagger else "15m",
+                            "RSI-EMA":round(float(r['RSI_EMA']),1),"Stoch K":round(float(r['STOCH_K']),1),
+                            "Stoch D":round(float(r['STOCH_D']),1),"MACD Hist":round(float(r['MACD_Hist']),4),
+                            "RVOL":round(rvol,2),"BB%":round(float(r['BB_pct']),2),
+                            "ROC 3B%":round(gain_pct,2),"VWAP":int(float(r['VWAP'])),
+                            "TP":int(tp),"SL":int(sl),"R:R":round(rr,1),
+                            "Turnover(M)":round(turnover/1e6,1),"Reasons":" · ".join(reasons),
+                            "_class":get_card_class(sig)
+                        })
+                    except: continue
+
+                prog_ph.empty(); pb.empty()
+                st.session_state.scan_results=results
+                st.session_state.last_scan_time=datetime.now(jakarta_tz).timestamp()
+                st.session_state.last_scan_mode=scan_mode
+
+                if tele_on and results:
+                    if 'tt_last_sent' not in st.session_state: st.session_state.tt_last_sent=set()
+                    df_tmp=pd.DataFrame(results).sort_values("Score",ascending=False)
+                    cur_set=set(df_tmp['Ticker'].tolist()); new_alr=cur_set-st.session_state.tt_last_sent
+                    if new_alr:
+                        top_new=df_tmp[df_tmp['Ticker'].isin(new_alr)].head(5).to_dict('records')
+                        if top_new: send_telegram(top_new)
+                        st.session_state.tt_last_sent.update(new_alr)
+                    st.session_state.tt_last_sent=st.session_state.tt_last_sent&cur_set
+
         except Exception as e:
-            prog_ph.empty(); st.error(f"Scan error: {str(e)[:100]}")
+            try: prog_ph.empty(); pb.empty()
+            except: pass
+            st.error(f"Scan error: {str(e)[:150]}")
 
     if st.session_state.last_scan_time:
         _now_cd=datetime.now(jakarta_tz).timestamp()
         _rem_cd=max(0,300-(_now_cd-st.session_state.last_scan_time))
         _last_cd=datetime.fromtimestamp(st.session_state.last_scan_time,jakarta_tz).strftime("%H:%M:%S")
-        st.caption(f"⏱️ Next auto-scan: {int(_rem_cd//60):02d}:{int(_rem_cd%60):02d} · Last: {_last_cd} WIB")
+        last_mode=st.session_state.get("last_scan_mode","")
+        tf_info="📅 Daily" if last_mode=="Bagger 💎" else "⚡ 15M"
+        st.caption(f"⏱️ Next auto-scan: {int(_rem_cd//60):02d}:{int(_rem_cd%60):02d} · Last: {_last_cd} WIB · {tf_info} · {last_mode}")
 
     results=st.session_state.scan_results
     if not results and not do_scan:
@@ -1032,7 +1200,7 @@ with tab_scanner:
           <div style="font-size:36px;margin-bottom:12px;">🔥</div>
           <div style="font-size:13px;letter-spacing:2px;">KLIK SCAN UNTUK MULAI</div>
           <div style="font-size:10px;margin-top:8px;color:#2d3748;">
-            {"⚡ Quick: 200 saham" if quick_mode else f"Full: {len(raw_stocks)} saham"} · Regime: {regime} · Auto mode: {rcfg["mode"]}
+            {"⚡ Quick: 200 saham" if quick_mode else f"Full: {len(raw_stocks)} saham"} · {regime} · {rcfg["mode"]}
           </div>
         </div>""", unsafe_allow_html=True)
     elif results:
@@ -1041,6 +1209,8 @@ with tab_scanner:
         bagger =df_out[df_out["Signal"].str.contains("BAGGER|KANDIDAT",na=False)]
         potensi=df_out[df_out["Signal"].str.contains("POTENSIAL",na=False)]
         avg_rsi=df_out['RSI-EMA'].mean()
+        last_mode=st.session_state.get("last_scan_mode","")
+        tf_badge='<span style="font-size:9px;color:#bf5fff;background:rgba(191,95,255,.1);padding:2px 6px;border-radius:3px;">📅 DAILY TF</span>' if last_mode=="Bagger 💎" else '<span style="font-size:9px;color:#00e5ff;background:rgba(0,229,255,.1);padding:2px 6px;border-radius:3px;">⚡ 15M</span>'
 
         st.markdown(f"""
         <div class="metric-row">
@@ -1048,11 +1218,12 @@ with tab_scanner:
             <div class="metric-value" style="font-size:16px;color:{rcolor}">{regime}</div>
             <div class="metric-sub">{ihsg_price:,.0f} {chg_sym}{abs(ihsg_chg):.2f}%</div></div>
           <div class="metric-card orange"><div class="metric-label">Mode</div>
-            <div class="metric-value" style="font-size:13px;margin-top:4px;">{scan_mode}</div></div>
+            <div class="metric-value" style="font-size:12px;margin-top:4px;">{last_mode}</div>
+            <div class="metric-sub">{tf_badge}</div></div>
           <div class="metric-card green"><div class="metric-label">Signal Lolos</div>
             <div class="metric-value">{len(df_out)}</div><div class="metric-sub">dari {len(raw_stocks)} emiten</div></div>
           <div class="metric-card purple"><div class="metric-label">BAGGER 💎</div>
-            <div class="metric-value">{len(bagger)}</div><div class="metric-sub">Wyckoff candidate</div></div>
+            <div class="metric-value">{len(bagger)}</div><div class="metric-sub">Wyckoff Daily</div></div>
           <div class="metric-card red"><div class="metric-label">GACOR 🔥</div>
             <div class="metric-value">{len(gacor)}</div><div class="metric-sub">score ≥ 5</div></div>
           <div class="metric-card amber"><div class="metric-label">POTENSIAL</div>
@@ -1069,14 +1240,15 @@ with tab_scanner:
             is_bag="BAGGER" in row['Signal'] or "KANDIDAT" in row['Signal']
             cls='bagger' if is_bag else('up' if roc>0 else('down' if roc<0 else'flat'))
             sym='💎' if is_bag else('▲' if roc>0 else('▼' if roc<0 else'─'))
-            th+=f'<span class="tape-item {cls}">{row["Ticker"]} {int(row["Price"])} {sym}{abs(roc):.1f}% [{row["Signal"]}]</span>'
+            tf_t="[D]" if row.get("TF","")=="Daily" else "[15M]"
+            th+=f'<span class="tape-item {cls}">{row["Ticker"]} {int(row["Price"])} {sym}{abs(roc):.1f}% {tf_t}</span>'
         th+=th.replace('tape-inner">',''); th+='</div></div>'
         st.markdown(th, unsafe_allow_html=True)
 
         if not bagger.empty:
-            st.markdown(f'<div class="bagger-alert-box"><div class="bagger-title">💎 WYCKOFF BAGGER ALERT · {len(bagger)} KANDIDAT · AKUMULASI + BREAKOUT</div><div style="font-size:11px;color:#4a5568;margin-top:4px;">Phase A-B (Sideways+Dry Vol) · Spring/Shakeout · Phase D (RVOL+Breakout)</div></div>',unsafe_allow_html=True)
+            st.markdown(f'<div class="bagger-alert-box"><div class="bagger-title">💎 WYCKOFF BAGGER ALERT · {len(bagger)} KANDIDAT · DAILY TF</div><div style="font-size:11px;color:#4a5568;margin-top:4px;">Phase A-B (Sideways+Dry Vol) · Spring/Shakeout · Phase D (RVOL+Breakout) — Chart Harian</div></div>',unsafe_allow_html=True)
         if not gacor.empty:
-            st.markdown(f'<div class="alert-box"><div class="alert-title">🚨 GACOR ALERT · {len(gacor)} SAHAM · {scan_mode}</div><div style="font-size:11px;color:#4a5568;margin-top:4px;">Score ≥ 5 · Konfirmasi multi-indikator 15M · R:R optimal</div></div>',unsafe_allow_html=True)
+            st.markdown(f'<div class="alert-box"><div class="alert-title">🚨 GACOR ALERT · {len(gacor)} SAHAM · {last_mode}</div><div style="font-size:11px;color:#4a5568;margin-top:4px;">Score ≥ 5 · Konfirmasi multi-indikator · R:R optimal</div></div>',unsafe_allow_html=True)
 
         if view_mode=="Card View 🃏":
             st.markdown('<div class="section-title">Signal Cards</div>',unsafe_allow_html=True)
@@ -1087,13 +1259,17 @@ with tab_scanner:
                 bar_cls="filled-purple" if is_bag else "filled"
                 bars=''.join([f'<div class="sc-bar {bar_cls if i<sc_int else "empty"}" style="width:28px"></div>' for i in range(6)])
                 roc_c='#00ff88' if row['ROC 3B%']>0 else'#ff3d5a'
-                trend_e="📈" if "▲" in row['Trend'] else("📉" if "▼" in row['Trend'] else"➡️")
+                te="📈" if "▲" in row['Trend'] else("📉" if "▼" in row['Trend'] else"➡️")
                 sig_color='#bf5fff' if is_bag else('#00ff88' if sc_int>=5 else '#ffb700' if sc_int>=4 else '#00e5ff')
+                tf_badge_card='<span style="font-size:8px;color:#bf5fff;margin-left:4px;">[D1]</span>' if row.get("TF","")=="Daily" else '<span style="font-size:8px;color:#4a5568;margin-left:4px;">[15M]</span>'
                 card_html+=f"""<div class="signal-card {row['_class']}">
                   <div style="display:flex;justify-content:space-between;align-items:flex-start;">
-                    <div><div class="sc-ticker">{row['Ticker']}</div><div class="sc-price" style="color:{roc_c}">{int(row['Price']):,} {trend_e}</div></div>
-                    <div style="text-align:right;"><div style="font-family:Space Mono,monospace;font-size:10px;color:#4a5568;">SCORE</div>
-                    <div style="font-family:Space Mono,monospace;font-size:20px;font-weight:700;color:{sig_color}">{row['Score']}</div></div>
+                    <div><div class="sc-ticker">{row['Ticker']}{tf_badge_card}</div>
+                    <div class="sc-price" style="color:{roc_c}">{int(row['Price']):,} {te}</div></div>
+                    <div style="text-align:right;">
+                      <div style="font-family:Space Mono,monospace;font-size:10px;color:#4a5568;">SCORE</div>
+                      <div style="font-family:Space Mono,monospace;font-size:20px;font-weight:700;color:{sig_color}">{row['Score']}</div>
+                    </div>
                   </div>
                   <div class="sc-signal" style="color:{sig_color}">{row['Signal']}</div>
                   <div class="sc-bars">{bars}</div>
@@ -1114,7 +1290,8 @@ with tab_scanner:
             st.markdown(card_html, unsafe_allow_html=True)
 
         st.markdown('<div class="section-title">Full Signal Table</div>',unsafe_allow_html=True)
-        display_cols=["Ticker","Price","Score","Signal","Trend","RSI-EMA","Stoch K","Stoch D","MACD Hist","RVOL","BB%","ROC 3B%","VWAP","TP","SL","R:R","Turnover(M)","Reasons"]
+        display_cols=["Ticker","TF","Price","Score","Signal","Trend","RSI-EMA","Stoch K","Stoch D","MACD Hist","RVOL","BB%","ROC 3B%","VWAP","TP","SL","R:R","Turnover(M)","Reasons"]
+        display_cols=[c for c in display_cols if c in df_out.columns]
         st.dataframe(df_out[display_cols],width='stretch',hide_index=True,column_config={
             "Score":      st.column_config.ProgressColumn("Score",min_value=0,max_value=6,format="%.1f"),
             "RSI-EMA":    st.column_config.NumberColumn("RSI-EMA",format="%.1f"),
@@ -1122,25 +1299,27 @@ with tab_scanner:
             "RVOL":       st.column_config.NumberColumn("RVOL",format="%.1fx"),
             "ROC 3B%":    st.column_config.NumberColumn("ROC 3B%",format="%.2f%%"),
             "Turnover(M)":st.column_config.NumberColumn("Turnover(M)",format="Rp%.0fM"),
+            "TF":         st.column_config.TextColumn("TF"),
         })
 
+
 # ════════════════════════════════════════════════════
-#  TAB 2: WATCHLIST ANALYZER
+#  TAB 2: WATCHLIST (with Bagger Daily support)
 # ════════════════════════════════════════════════════
 with tab_watchlist:
-    st.markdown("""
-    <div style="font-family:Space Mono,monospace;font-size:10px;color:#4a5568;margin-bottom:12px;
+    st.markdown("""<div style="font-family:Space Mono,monospace;font-size:10px;color:#4a5568;margin-bottom:12px;
          padding:10px 14px;background:#0d1117;border-radius:6px;border-left:3px solid #ff7b00;">
-      Analisa mendalam untuk saham pilihan lo & grup. Input ticker IDX (tanpa .JK), pisah koma atau enter.
+      Analisa mendalam per saham. Bagger 💎 otomatis pakai <b style="color:#bf5fff">Daily TF</b>.
     </div>""", unsafe_allow_html=True)
-
     wc1,wc2,wc3 = st.columns([3,1,1])
     with wc1:
-        wl_input = st.text_area("Ticker",placeholder="Contoh:\nBBCA\nARCI, ASSA, GOTO\nBBRI, BMRI",
+        wl_input = st.text_area("Ticker",placeholder="Contoh:\nBBCA\nARCI, ASSA, GOTO",
                                 height=120,label_visibility="collapsed",key="wl_input")
     with wc2:
         wl_mode = st.radio("Mode",["Scalping ⚡","Momentum 🚀","Reversal 🎯","Bagger 💎"],key="wl_mode")
         st.caption(f"Regime suggest: {rcfg['mode']}")
+        if wl_mode=="Bagger 💎":
+            st.markdown('<div style="font-size:9px;color:#bf5fff;">📅 Pakai Daily TF</div>',unsafe_allow_html=True)
     with wc3:
         st.markdown("<br>",unsafe_allow_html=True)
         wl_run   = st.button("🔍 Analisa",use_container_width=True,key="wl_run")
@@ -1151,27 +1330,34 @@ with tab_watchlist:
         raw_wl=list(dict.fromkeys([t.strip().upper() for line in wl_input.split("\n")
                                    for t in line.split(",") if t.strip()]))
         if raw_wl:
-            with st.spinner(f"Menganalisa {len(raw_wl)} saham..."):
+            with st.spinner(f"Menganalisa {len(raw_wl)} saham ({'Daily' if wl_mode=='Bagger 💎' else '15M'})..."):
                 wl_res=[]
                 for t in raw_wl:
                     df=None
                     try:
-                        raw=yf.download(t+".JK",period="5d",interval="15m",
-                                        progress=False,auto_adjust=True,threads=False)
-                        if not raw.empty:
-                            if isinstance(raw.columns,pd.MultiIndex): raw.columns=raw.columns.droplevel(1)
-                            df=raw.dropna()
-                            if len(df)<10: df=None
+                        # Bagger: fetch daily, lainnya: 15m
+                        if wl_mode=="Bagger 💎":
+                            raw=yf.download(t+".JK",period="60d",interval="1d",
+                                            progress=False,auto_adjust=True,threads=False)
+                            min_b=20
+                        else:
+                            raw=yf.download(t+".JK",period="5d",interval="15m",
+                                            progress=False,auto_adjust=True,threads=False)
+                            min_b=55
+                        df = _yf_extract(raw, t+".JK", 1)
+                        if df is not None and len(df)<min_b: df=None
                     except: pass
-                    if df is None or len(df)<55:
+
+                    if df is None:
                         wl_res.append({"Ticker":t,"Price":0,"Score":0,"Signal":"No data",
                             "RSI-EMA":0,"Stoch K":0,"RVOL":0,"BB%":0,"Trend":"-",
                             "TP":0,"SL":0,"R:R":0,"ROC 3B%":0,"VWAP":0,"ATR":0,
-                            "Reasons":"No data","_class":"","MACD Hist":0}); continue
+                            "Reasons":"No data","_class":"","MACD Hist":0,"TF":"-"}); continue
                     try:
-                        df=apply_intraday_indicators(df)
+                        df=apply_indicators(df)
                         r=df.iloc[-1]; p=df.iloc[-2]; p2=df.iloc[-3] if len(df)>=3 else p
-                        close=float(r['Close']); atr=float(r['ATR']); slm=rcfg.get("sl_mult",0.8)
+                        close=float(r['Close']); atr=float(r['ATR']) if not np.isnan(float(r['ATR'])) else close*0.01
+                        slm=rcfg.get("sl_mult",0.8)
                         if wl_mode=="Scalping ⚡":   sc,reasons,_=score_scalping(r,p,p2);  tp=close+1.5*atr; sl=close-slm*atr
                         elif wl_mode=="Momentum 🚀": sc,reasons,_=score_momentum(r,p,p2);  tp=close+2.0*atr; sl=close-slm*atr
                         elif wl_mode=="Bagger 💎":   sc,reasons,_=score_bagger(r,p,p2,df); tp=close+3.0*atr; sl=close-1.0*atr
@@ -1182,7 +1368,8 @@ with tab_watchlist:
                         _pvt=fetch_pivot_data(t+".JK"); _pvt_pos=get_pivot_position(close,_pvt)[0] if _pvt else "-"
                         _mtf=score_mtf(t+".JK",mode=wl_mode); _align,_align_col,_avg=mtf_alignment(_mtf)
                         wl_res.append({"Ticker":t,"Price":int(close),"Score":sc,"Signal":sig,
-                            "Trend":trend,"RSI-EMA":round(float(r['RSI_EMA']),1),
+                            "Trend":trend,"TF":"Daily" if wl_mode=="Bagger 💎" else "15M",
+                            "RSI-EMA":round(float(r['RSI_EMA']),1),
                             "Stoch K":round(float(r['STOCH_K']),1),"RVOL":round(float(r['RVOL']),2),
                             "BB%":round(float(r['BB_pct']),2),"ROC 3B%":round(float(r['ROC3'])*100,2),
                             "VWAP":int(float(r['VWAP'])),"TP":int(tp),"SL":int(sl),"R:R":round(rr,1),
@@ -1196,18 +1383,16 @@ with tab_watchlist:
                             "M15":_mtf.get("M15",0),"H1":_mtf.get("H1",0),"D1":_mtf.get("D1",0)})
                     except Exception as ex:
                         wl_res.append({"Ticker":t,"Price":0,"Score":0,"Signal":f"Err:{str(ex)[:20]}",
-                            "RSI-EMA":0,"Stoch K":0,"RVOL":0,"BB%":0,"Trend":"-",
+                            "RSI-EMA":0,"Stoch K":0,"RVOL":0,"BB%":0,"Trend":"-","TF":"-",
                             "TP":0,"SL":0,"R:R":0,"ROC 3B%":0,"VWAP":0,"ATR":0,
                             "Reasons":"","_class":"","MACD Hist":0})
 
             st.session_state.wl_results=wl_res; st.session_state.wl_mode_used=wl_mode
-
-            ok  = [r for r in wl_res if r["Score"]>0]
-            bag = [r for r in ok if any(k in r.get("Signal","") for k in ["BAGGER","KANDIDAT"])]
-            gcr = [r for r in ok if any(k in r.get("Signal","") for k in ["GACOR","REVERSAL"])]
-            pot = [r for r in ok if "POTENSIAL" in r.get("Signal","")]
-            st.markdown(f"""
-            <div class="metric-row" style="margin-top:16px;">
+            ok=[r for r in wl_res if r["Score"]>0]
+            bag=[r for r in ok if any(k in r.get("Signal","") for k in ["BAGGER","KANDIDAT"])]
+            gcr=[r for r in ok if any(k in r.get("Signal","") for k in ["GACOR","REVERSAL"])]
+            pot=[r for r in ok if "POTENSIAL" in r.get("Signal","")]
+            st.markdown(f"""<div class="metric-row" style="margin-top:16px;">
               <div class="metric-card orange"><div class="metric-label">Dipantau</div><div class="metric-value">{len(raw_wl)}</div></div>
               <div class="metric-card purple"><div class="metric-label">BAGGER 💎</div><div class="metric-value">{len(bag)}</div></div>
               <div class="metric-card green"><div class="metric-label">GACOR 🔥</div><div class="metric-value">{len(gcr)}</div></div>
@@ -1226,9 +1411,10 @@ with tab_watchlist:
                 rsi_v=row["RSI-EMA"]; rsi_c="#ff3d5a" if rsi_v<30 else("#ffb700" if rsi_v<45 else "#00ff88" if rsi_v>60 else "#c9d1d9")
                 roc_c="#00ff88" if row.get("ROC 3B%",0)>0 else "#ff3d5a"
                 te="📈" if "▲" in row["Trend"] else("📉" if "▼" in row["Trend"] else "➡️")
+                tf_b='<span style="font-size:8px;color:#bf5fff;">[D1]</span>' if row.get("TF","")=="Daily" else '<span style="font-size:8px;color:#4a5568;">[15M]</span>'
                 ch+=f"""<div class="signal-card {row['_class']}">
                   <div style="display:flex;justify-content:space-between;">
-                    <div><div class="sc-ticker">{row['Ticker']}</div>
+                    <div><div class="sc-ticker">{row['Ticker']} {tf_b}</div>
                     <div class="sc-price" style="color:{roc_c}">{row['Price']:,} {te}</div></div>
                     <div style="text-align:right">
                       <div style="font-family:Space Mono,monospace;font-size:9px;color:#4a5568">SCORE</div>
@@ -1253,7 +1439,7 @@ with tab_watchlist:
                     <div style="font-family:Space Mono,monospace;font-size:9px;padding:2px 7px;border-radius:10px;background:rgba(0,0,0,.3);color:#4a5568;">MTF: {row.get('MTF Align','-')}</div>
                   </div>
                   <div style="font-family:Space Mono,monospace;font-size:9px;color:#4a5568;margin-top:4px;">
-                    M15:{row.get('M15',0)} · H1:{row.get('H1',0)} · D1:{row.get('D1',0)} &nbsp;|&nbsp; PP:{row.get('PP',0):,} · R1:{row.get('R1',0):,} · S1:{row.get('S1',0):,}
+                    M15:{row.get('M15',0)} · H1:{row.get('H1',0)} · D1:{row.get('D1',0)} | PP:{row.get('PP',0):,} · R1:{row.get('R1',0):,} · S1:{row.get('S1',0):,}
                   </div>
                 </div>"""
             ch+='</div>'
@@ -1261,7 +1447,7 @@ with tab_watchlist:
 
             df_wl=pd.DataFrame([r for r in wl_res if r["Price"]>0])
             if not df_wl.empty:
-                show=["Ticker","Price","Score","Signal","Trend","RSI-EMA","Stoch K","RVOL","BB%","ROC 3B%","VWAP","TP","SL","R:R","MTF Align","M15","H1","D1","Pivot Pos","PP","R1","S1","ATR","Reasons"]
+                show=["Ticker","TF","Price","Score","Signal","Trend","RSI-EMA","Stoch K","RVOL","BB%","ROC 3B%","VWAP","TP","SL","R:R","MTF Align","M15","H1","D1","Pivot Pos","PP","R1","S1","ATR","Reasons"]
                 show=[c for c in show if c in df_wl.columns]
                 st.dataframe(df_wl[show],width='stretch',hide_index=True,column_config={
                     "Score":   st.column_config.ProgressColumn("Score",min_value=0,max_value=6,format="%.1f"),
@@ -1276,29 +1462,25 @@ with tab_watchlist:
 
     if wl_share and st.session_state.wl_results:
         now_str=datetime.now(jakarta_tz).strftime("%d %b %Y %H:%M")
-        txt=f"🔥 THETA TURBO WATCHLIST\n⏰ {now_str} WIB\n📊 Mode: {st.session_state.get('wl_mode_used','')} | Regime: {regime}\n"+"─"*28+"\n"
+        wl_used=st.session_state.get('wl_mode_used','')
+        txt=f"🔥 THETA TURBO WATCHLIST\n⏰ {now_str} WIB\n📊 Mode: {wl_used} | Regime: {regime}\n"+"─"*28+"\n"
         for r in sorted(st.session_state.wl_results,key=lambda x:x["Score"],reverse=True):
             if r["Price"]==0: continue
             sig=r.get("Signal","-")
             em="💎" if ("BAGGER" in sig or "KANDIDAT" in sig) else("🔥" if ("GACOR" in sig or "REVERSAL" in sig) else("⚡" if "POTENSIAL" in sig else "👀"))
-            txt+=f"{em} {r['Ticker']} | {r['Price']:,} | Score:{r['Score']} | RSI:{r['RSI-EMA']} | {sig}\n"
+            tf_t="[D1]" if r.get("TF","")=="Daily" else "[15M]"
+            txt+=f"{em} {r['Ticker']}{tf_t} | {r['Price']:,} | Score:{r['Score']} | RSI:{r['RSI-EMA']} | {sig}\n"
             if r.get("Reasons"): txt+=f"   → {r['Reasons'][:60]}\n"
-        txt+="─"*28+"\nby Theta Turbo v5.2 🔥 (Wyckoff Bagger)"
+        txt+="─"*28+"\nby Theta Turbo v5.2 🔥 (Wyckoff Bagger Daily)"
         st.text_area("Copy untuk grup:",txt,height=280,key="share_out")
 
     if not st.session_state.wl_results and not wl_run:
-        st.markdown("""
-        <div style="text-align:center;padding:48px;color:#4a5568;font-family:Space Mono,monospace;">
+        st.markdown("""<div style="text-align:center;padding:48px;color:#4a5568;font-family:Space Mono,monospace;">
           <div style="font-size:32px;margin-bottom:12px;">👁️</div>
           <div style="font-size:12px;letter-spacing:2px;">MASUKKAN TICKER DI ATAS</div>
-          <div style="font-size:10px;margin-top:8px;color:#2d3748;">
-            Bisa 1 atau banyak · Pisah koma atau enter<br>Contoh: BBCA, ARCI, ASSA, GOTO
-          </div>
+          <div style="font-size:10px;margin-top:8px;color:#2d3748;">Bagger 💎 otomatis pakai Daily TF · Lainnya 15M</div>
         </div>""", unsafe_allow_html=True)
 
-# ════════════════════════════════════════════════════
-#  TAB 3: BSJP
-# ════════════════════════════════════════════════════
 with tab_bsjp:
     now_wib=datetime.now(jakarta_tz)
     is_entry_time=(now_wib.hour==14 and now_wib.minute>=30) or (now_wib.hour==15 and now_wib.minute<=45)
@@ -1340,7 +1522,7 @@ with tab_bsjp:
             try:
                 df=scan_data[ticker_yf].copy()
                 if len(df)<55: continue
-                df_copy=apply_intraday_indicators(df)
+                df_copy=apply_indicators(df)
                 r=df_copy.iloc[-1]; p=df_copy.iloc[-2]; p2=df_copy.iloc[-3] if len(df_copy)>=3 else p
                 close=float(r['Close']); vol=float(r['Volume'])
                 turnover=close*vol; rvol=float(r['RVOL'])
@@ -1646,9 +1828,9 @@ with tab_trail:
             try:
                 raw_tr=yf.download(tr_ticker+".JK",period="5d",interval="15m",
                                    progress=False,auto_adjust=True,threads=False)
-                if not raw_tr.empty:
+                if df_tr is not None:
                     if isinstance(raw_tr.columns,pd.MultiIndex): raw_tr.columns=raw_tr.columns.droplevel(1)
-                    df_tr=apply_intraday_indicators(raw_tr.dropna())
+                    df_tr=apply_indicators(raw_tr.dropna())
                     current=float(df_tr["Close"].iloc[-1]); atr_val=float(df_tr["ATR"].iloc[-1])
                     if tr_method=="ATR":      trail_result=calc_trailing_stop(tr_entry,current,atr_val,"ATR",tr_atr_mult)
                     elif tr_method=="Persen": trail_result=calc_trailing_stop(tr_entry,current,atr_val,"Persen",pct=tr_pct)
@@ -1721,7 +1903,7 @@ with tab_backtest:
                 try:
                     d=data_dict[t_yf].copy()
                     if len(d)<60: continue
-                    d=apply_intraday_indicators(d)
+                    d=apply_indicators(d)
                     for ii in range(50,len(d)-bt_fwd):
                         r0=d.iloc[ii]; r1=d.iloc[ii-1]; r2=d.iloc[ii-2]
                         if bt_mode=="Scalping ⚡":   sc,_,_=score_scalping(r0,r1,r2)
@@ -1797,32 +1979,32 @@ with tab_backtest:
                         st.markdown(f'<div style="margin-bottom:10px;"><div style="display:flex;justify-content:space-between;"><span style="font-family:Space Mono,monospace;font-size:12px;color:#c9d1d9;">Score {sc_lv} [{"█"*sc_lv+"░"*(6-sc_lv)}]</span><span style="font-family:Space Mono,monospace;font-size:11px;color:{col};">{wr_v:.1f}% WR · avg {avg_v:+.2f}% · {len(a)} trades</span></div><div style="height:8px;background:var(--border);border-radius:4px;overflow:hidden;margin-top:4px;"><div style="width:{int(wr_v)}%;height:100%;background:{col};border-radius:4px;"></div></div></div>',unsafe_allow_html=True)
 
 # ════════════════════════════════════════════════════
-#  FOOTER
+#  FOOTER + AUTO-REFRESH
 # ════════════════════════════════════════════════════
-_now_f=datetime.now(jakarta_tz).timestamp()
+_now_f = datetime.now(jakarta_tz).timestamp()
 if st.session_state.last_scan_time:
-    _rem2=max(0,300-(_now_f-st.session_state.last_scan_time))
-    mnt2=int(_rem2//60); sec2=int(_rem2%60)
-    last_t2=datetime.fromtimestamp(st.session_state.last_scan_time,jakarta_tz).strftime("%H:%M:%S")
-    time_info=f"⏱️ Next auto-scan: <span style='color:#ff7b00'>{mnt2:02d}:{sec2:02d}</span> · Last: <span style='color:#2dd4bf'>{last_t2} WIB</span>"
+    _rem2   = max(0, 300-(_now_f-st.session_state.last_scan_time))
+    mnt2    = int(_rem2//60); sec2=int(_rem2%60)
+    last_t2 = datetime.fromtimestamp(st.session_state.last_scan_time,jakarta_tz).strftime("%H:%M:%S")
+    last_mode_f = st.session_state.get("last_scan_mode","")
+    tf_f    = "📅 Daily" if last_mode_f=="Bagger 💎" else "⚡ 15M"
+    time_info = f"⏱️ Next: <span style='color:#ff7b00'>{mnt2:02d}:{sec2:02d}</span> · Last: <span style='color:#2dd4bf'>{last_t2} WIB</span> · {tf_f}"
 else:
-    time_info="⏱️ Klik Scan untuk mulai"
+    _rem2 = 300
+    time_info = "⏱️ Klik Scan untuk mulai"
 
 st.markdown(f"""
 <div style="margin-top:28px;padding-top:14px;border-top:1px solid #1c2533;
      display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;">
   <div style="font-family:Space Mono,monospace;font-size:10px;color:#4a5568;">
-    🔥 Theta Turbo v5.2 · Wyckoff Bagger · Auto Regime · IDX 900+ Emiten
+    🔥 Theta Turbo v5.2 · Wyckoff Bagger Daily · Auto Regime · IDX 900+
   </div>
   <div style="font-family:Space Mono,monospace;font-size:10px;color:#4a5568;">{time_info}</div>
 </div>""", unsafe_allow_html=True)
 
-# ════════════════════════════════════════════════════
-#  AUTO-REFRESH — NON-BLOCKING
-# ════════════════════════════════════════════════════
+# Auto-rerun — simple & clean, no JS conflict
 if st.session_state.last_scan_time:
-    _now_f2  =datetime.now(jakarta_tz).timestamp()
-    _elapsed2=_now_f2-st.session_state.last_scan_time
-    if _elapsed2>=295:
+    _elapsed_f = _now_f - st.session_state.last_scan_time
+    if _elapsed_f >= 295:
         time.sleep(5)
         st.rerun()
