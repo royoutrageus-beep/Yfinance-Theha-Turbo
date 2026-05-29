@@ -6,7 +6,6 @@ import requests
 import numpy as np
 import pytz
 from datetime import datetime
-import requests_cache
 from requests_ratelimiter import LimiterSession
 
 # 1. Bikin session anti-block (Maks 2 request/detik, simpan cache 10 menit)
