@@ -6,6 +6,22 @@ import requests
 import numpy as np
 import pytz
 from datetime import datetime
+import requests_cache
+from requests_ratelimiter import LimiterSession
+
+# 1. Bikin session anti-block (Maks 2 request/detik, simpan cache 10 menit)
+session = LimiterSession(per_second=2)
+session = requests_cache.CachedSession(
+    cache_name='yf_safe_cache', 
+    backend='sqlite', 
+    expire_after=600, 
+    session=session
+)
+
+# 2. Spoofing User-Agent biar dikira browser biasa, bukan bot Python
+session.headers.update({
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36'
+})
 
 # ════════════════════════════════════════════════════
 #  CONFIG
