@@ -826,14 +826,53 @@ def get_pivot_position(price, pivots):
 # ════════════════════════════════════════════════════
 @st.cache_data(ttl=360)
 def fetch_mtf_data(ticker_yf):
+    """
+    FIXED: Download 15m SEKALI lalu resample lokal ke 1h dan 1d.
+    Sebelumnya: 3 request ke Yahoo Finance per ticker = rate limit!
+    Sekarang:   1 request saja, resample internal = ZERO rate limit risk.
+    """
     result = {}
-    for interval,period,key in [("15m","3d","M15"),("1h","10d","H1"),("1d","60d","D1")]:
+    try:
+        # Download 15m data (5 hari) — 1 request saja!
+        raw = yf.download(ticker_yf, period="5d", interval="15m",
+                          progress=False, auto_adjust=True, threads=False)
+        df15 = _yf_extract(raw, ticker_yf, 1)
+        if df15 is None or len(df15) < 10:
+            return result
+
+        # M15 — langsung pakai
+        if len(df15) >= 20:
+            result["M15"] = df15
+
+        # H1 — resample dari 15m, tidak perlu download!
         try:
-            raw = yf.download(ticker_yf, period=period, interval=interval,
-                              progress=False, auto_adjust=True, threads=False)
-            df = _yf_extract(raw, ticker_yf, 1)
-            if df is not None and len(df) >= 20: result[key] = df
+            df1h = df15.resample("1h").agg({
+                "Open":   "first",
+                "High":   "max",
+                "Low":    "min",
+                "Close":  "last",
+                "Volume": "sum"
+            }).dropna(subset=["Close"])
+            df1h = df1h[df1h["Volume"] > 0]
+            if len(df1h) >= 10:
+                result["H1"] = df1h
         except: pass
+
+        # D1 — resample dari 15m, tidak perlu download!
+        try:
+            df1d = df15.resample("1D").agg({
+                "Open":   "first",
+                "High":   "max",
+                "Low":    "min",
+                "Close":  "last",
+                "Volume": "sum"
+            }).dropna(subset=["Close"])
+            df1d = df1d[df1d["Volume"] > 0]
+            if len(df1d) >= 3:
+                result["D1"] = df1d
+        except: pass
+
+    except: pass
     return result
 
 def score_mtf(ticker_yf, mode="Scalping ⚡"):
@@ -1365,8 +1404,49 @@ with tab_watchlist:
                         sig=get_signal(sc,wl_mode); rr=(tp-close)/max(close-sl,0.01)
                         e9=float(r['EMA9']); e21=float(r['EMA21']); e50=float(r['EMA50'])
                         trend="▲ UP" if e9>e21>e50 else("▼ DOWN" if e9<e21<e50 else "◆ SIDE")
-                        _pvt=fetch_pivot_data(t+".JK"); _pvt_pos=get_pivot_position(close,_pvt)[0] if _pvt else "-"
-                        _mtf=score_mtf(t+".JK",mode=wl_mode); _align,_align_col,_avg=mtf_alignment(_mtf)
+                        # FIXED: MTF pakai local resample (sudah di fetch_mtf_data)
+                        # Pivot dihitung dari data 15m yang sudah ada — no extra request!
+                        _pvt=None
+                        try:
+                            if len(df)>=2:
+                                prev=df.iloc[-2]
+                                pp=(float(prev["High"])+float(prev["Low"])+float(prev["Close"]))/3
+                                _pvt={"PP":pp,"R1":2*pp-float(prev["Low"]),
+                                      "R2":pp+(float(prev["High"])-float(prev["Low"])),
+                                      "S1":2*pp-float(prev["High"]),
+                                      "S2":pp-(float(prev["High"])-float(prev["Low"]))}
+                        except: pass
+                        _pvt_pos=get_pivot_position(close,_pvt)[0] if _pvt else "-"
+                        # MTF: pakai df yang sudah di-fetch (no extra download!)
+                        _mtf = {}
+                        try:
+                            _df_mtf = apply_indicators(df.copy())
+                            if len(_df_mtf) >= 3:
+                                _r=_df_mtf.iloc[-1]; _p=_df_mtf.iloc[-2]; _p2=_df_mtf.iloc[-3]
+                                if wl_mode=="Scalping ⚡":   _sc_m,_,_=score_scalping(_r,_p,_p2)
+                                elif wl_mode=="Momentum 🚀": _sc_m,_,_=score_momentum(_r,_p,_p2)
+                                elif wl_mode=="Bagger 💎":   _sc_m,_,_=score_bagger(_r,_p,_p2,_df_mtf)
+                                else:                         _sc_m,_,_=score_reversal(_r,_p,_p2)
+                                _mtf["M15"] = round(_sc_m, 1)
+                                # H1 dan D1 via resample (no download)
+                                for _rs_rule, _rs_key, _min_b in [("1h","H1",10),("1D","D1",3)]:
+                                    try:
+                                        _df_rs=df.resample(_rs_rule).agg(
+                                            {"Open":"first","High":"max","Low":"min",
+                                             "Close":"last","Volume":"sum"}).dropna(subset=["Close"])
+                                        _df_rs=_df_rs[_df_rs["Volume"]>0]
+                                        if len(_df_rs)>=_min_b:
+                                            _df_rs=apply_indicators(_df_rs)
+                                            _rr=_df_rs.iloc[-1]; _pp=_df_rs.iloc[-2]
+                                            _p2r=_df_rs.iloc[-3] if len(_df_rs)>=3 else _pp
+                                            if wl_mode=="Scalping ⚡":   _sc_r,_,_=score_scalping(_rr,_pp,_p2r)
+                                            elif wl_mode=="Momentum 🚀": _sc_r,_,_=score_momentum(_rr,_pp,_p2r)
+                                            elif wl_mode=="Bagger 💎":   _sc_r,_,_=score_bagger(_rr,_pp,_p2r,_df_rs)
+                                            else:                         _sc_r,_,_=score_reversal(_rr,_pp,_p2r)
+                                            _mtf[_rs_key] = round(_sc_r, 1)
+                                    except: pass
+                        except: pass
+                        _align,_align_col,_avg=mtf_alignment(_mtf)
                         wl_res.append({"Ticker":t,"Price":int(close),"Score":sc,"Signal":sig,
                             "Trend":trend,"TF":"Daily" if wl_mode=="Bagger 💎" else "15M",
                             "RSI-EMA":round(float(r['RSI_EMA']),1),
