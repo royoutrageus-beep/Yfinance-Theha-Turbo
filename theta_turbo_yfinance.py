@@ -2,6 +2,7 @@ import yfinance as yf
 import pandas as pd
 import streamlit as st
 import time
+import random
 import requests
 import numpy as np
 import pytz
@@ -211,114 +212,233 @@ seen = set(); raw_stocks = [x for x in raw_stocks if not (x in seen or seen.add(
 stocks_yf  = [s + ".JK" for s in raw_stocks]
 stock_map  = {s + ".JK": s for s in raw_stocks}
 
+# ════════════════════════════════════════════════════
+#  HUMANIZED FETCH HELPERS v2 — anti Yahoo rate limit
+#  Strategy: random chunk size + variable human-like delay
+# ════════════════════════════════════════════════════
+import requests as _req_sess
+_YF_SESSION = _req_sess.Session()
+_YF_SESSION.headers.update({
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.5",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+})
 
-# ════════════════════════════════════════════════════
-#  YFINANCE SAFE EXTRACTOR
-#  FIX: yfinance 0.2.x+ MultiIndex structure changed
-#  Old: raw[ticker] → DataFrame  ✅
-#  New (some versions): raw has (Price, Ticker) not (Ticker, Price) → raw[ticker] KeyError
-# ════════════════════════════════════════════════════
-def _yf_extract(raw, ticker, n_batch):
+def _human_sleep(batch_num, total_batches):
     """
-    Robust extraction dari yfinance multi-download result.
-    Handles semua versi yfinance (0.1.x, 0.2.x, 0.2.31+).
+    Mimic human browsing pattern:
+    - Checkpoint pause di 25/50/75% (kayak manusia baca layar)
+    - 10% chance long pause (distracted)
+    - 20% chance medium pause
+    - Sisanya short random delay
     """
+    pct = batch_num / max(total_batches, 1)
+    if abs(pct-0.25)<0.06 or abs(pct-0.50)<0.06 or abs(pct-0.75)<0.06:
+        pause = random.uniform(3.0, 6.0)
+    elif random.random() < 0.10:
+        pause = random.uniform(5.0, 9.0)
+    elif random.random() < 0.20:
+        pause = random.uniform(1.5, 3.5)
+    else:
+        pause = random.uniform(0.4, 1.3)
+    time.sleep(pause)
+
+def _random_chunks(tickers, min_sz=5, max_sz=15):
+    """Random batch sizes — tidak fixed, lebih natural kayak manusia."""
+    lst = list(tickers)
+    batches = []
+    i = 0
+    while i < len(lst):
+        sz = min(random.randint(min_sz, max_sz), len(lst)-i)
+        batches.append(lst[i:i+sz])
+        i += sz
+    return batches
+
+def _ticker_history(ticker_yf, period="7d", interval="15m"):
+    """yf.Ticker().history() — pakai chart API, endpoint beda dari download."""
     try:
-        if raw is None or raw.empty:
-            return None
-        if n_batch == 1:
-            df = raw.copy()
-        else:
-            if not isinstance(raw.columns, pd.MultiIndex):
-                return None
-            # Cek level mana yang berisi ticker
-            l0 = list(raw.columns.get_level_values(0).unique())
-            l1 = list(raw.columns.get_level_values(1).unique())
-            if ticker in l0:
-                df = raw[ticker].copy()
-            elif ticker in l1:
-                df = raw.xs(ticker, axis=1, level=1).copy()
-            else:
-                return None
-
-        # Flatten remaining MultiIndex
+        t = yf.Ticker(ticker_yf, session=_YF_SESSION)
+        df = t.history(period=period, interval=interval, auto_adjust=True)
+        if df is None or df.empty: return None
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.droplevel(-1)
+        rename = {c:c.capitalize() for c in df.columns if c.islower()}
+        if rename: df = df.rename(columns=rename)
+        req = ["Open","High","Low","Close","Volume"]
+        if any(c not in df.columns for c in req): return None
+        df = df[req].dropna(subset=["Close"])
+        df = df[df["Volume"] > 0]
+        return df if len(df) >= 2 else None
+    except: return None
 
-        # Rename kolom kalau lowercase (beberapa versi yf return lowercase)
-        rename_map = {c: c.capitalize() for c in df.columns if c.islower()}
-        if rename_map:
-            df = df.rename(columns=rename_map)
-        # Handle 'Adj Close' → skip, pakai 'Close' yang sudah auto_adjust
-        required = ['Open', 'High', 'Low', 'Close', 'Volume']
-        missing  = [c for c in required if c not in df.columns]
-        if missing:
-            return None
-
-        df = df[required].copy()
-        df = df.dropna(subset=['Close'])
-        df = df[df['Volume'] > 0]   # buang bar dengan volume 0
+def _yf_extract(raw, ticker, n_batch):
+    """Robust yfinance MultiIndex extraction — all versions supported."""
+    try:
+        if raw is None or raw.empty: return None
+        _ohlcv = {'Open','High','Low','Close','Volume','open','high','low','close','volume'}
+        if n_batch == 1:
+            df = raw.copy()
+            if isinstance(df.columns, pd.MultiIndex):
+                l0 = df.columns.get_level_values(0).unique().tolist()
+                l1 = df.columns.get_level_values(1).unique().tolist()
+                if any(x in _ohlcv for x in l0):   df = df.droplevel(1, axis=1)
+                elif any(x in _ohlcv for x in l1): df = df.droplevel(0, axis=1)
+        else:
+            if not isinstance(raw.columns, pd.MultiIndex): return None
+            l0 = raw.columns.get_level_values(0).unique().tolist()
+            l1 = raw.columns.get_level_values(1).unique().tolist()
+            if ticker in l0:   df = raw[ticker].copy()
+            elif ticker in l1: df = raw.xs(ticker, axis=1, level=1).copy()
+            else: return None
+            if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.droplevel(-1)
+        rename = {c: c.capitalize() for c in df.columns if c.islower()}
+        if rename: df = df.rename(columns=rename)
+        if 'Adj Close' in df.columns and 'Close' not in df.columns:
+            df = df.rename(columns={'Adj Close': 'Close'})
+        required = ['Open','High','Low','Close','Volume']
+        if any(c not in df.columns for c in required): return None
+        df = df[required].dropna(subset=['Close'])
+        df = df[df['Volume'] > 0]
         return df if len(df) > 0 else None
-    except:
-        return None
+    except: return None
+
+# ════════════════════════════════════════════════════
+#  FETCH INTRADAY — HUMANIZED v2
+#  Random chunk + variable delay = anti Yahoo bot detection
+# ════════════════════════════════════════════════════
+@st.cache_data(ttl=300)
+def fetch_intraday(tickers, chunk=None):
+    all_dfs = {}
+    batches = _random_chunks(list(tickers), min_sz=5, max_sz=15)
+    n_b     = len(batches)
+    for bi, batch in enumerate(batches):
+        if not batch: continue
+        if len(batch) == 1:
+            try:
+                df = _ticker_history(batch[0], "7d", "15m")
+                if df is None:
+                    raw = yf.download(batch[0], period="7d", interval="15m",
+                                      progress=False, auto_adjust=True,
+                                      threads=False, session=_YF_SESSION)
+                    df  = _yf_extract(raw, batch[0], 1)
+                if df is not None and len(df) >= 30:
+                    all_dfs[batch[0]] = df
+            except: pass
+            time.sleep(random.uniform(0.2, 0.6))
+        else:
+            try:
+                raw = yf.download(
+                    list(batch), period="7d", interval="15m",
+                    group_by='ticker', progress=False,
+                    threads=False, auto_adjust=True, session=_YF_SESSION
+                )
+                for t in batch:
+                    try:
+                        df = _yf_extract(raw, t, len(batch))
+                        if df is not None and len(df) >= 30:
+                            all_dfs[t] = df
+                    except: pass
+            except:
+                for t in batch:
+                    if t in all_dfs: continue
+                    try:
+                        df = _ticker_history(t, "7d", "15m")
+                        if df is None:
+                            raw = yf.download(t, period="7d", interval="15m",
+                                              progress=False, auto_adjust=True,
+                                              threads=False, session=_YF_SESSION)
+                            df  = _yf_extract(raw, t, 1)
+                        if df is not None and len(df) >= 30:
+                            all_dfs[t] = df
+                    except: pass
+                    time.sleep(random.uniform(0.2, 0.5))
+        _human_sleep(bi, n_b)
+    return all_dfs
+
+@st.cache_data(ttl=600)
+def fetch_daily_bagger(tickers, chunk=None):
+    """Fetch 60-hari DAILY untuk Wyckoff Bagger — HUMANIZED v2."""
+    all_dfs = {}
+    batches = _random_chunks(list(tickers), min_sz=8, max_sz=25)
+    n_b     = len(batches)
+    for bi, batch in enumerate(batches):
+        if not batch: continue
+        try:
+            raw = yf.download(
+                list(batch), period="60d", interval="1d",
+                group_by='ticker', progress=False,
+                threads=False, auto_adjust=True, session=_YF_SESSION
+            )
+            for t in batch:
+                try:
+                    df = _yf_extract(raw, t, len(batch))
+                    if df is not None and len(df) >= 20:
+                        all_dfs[t] = df
+                except: pass
+        except:
+            for t in batch:
+                if t in all_dfs: continue
+                try:
+                    df = _ticker_history(t, "60d", "1d")
+                    if df is None:
+                        raw = yf.download(t, period="60d", interval="1d",
+                                          progress=False, auto_adjust=True,
+                                          threads=False, session=_YF_SESSION)
+                        df  = _yf_extract(raw, t, 1)
+                    if df is not None and len(df) >= 20:
+                        all_dfs[t] = df
+                except: pass
+                time.sleep(random.uniform(0.2, 0.6))
+        _human_sleep(bi, n_b)
+    return all_dfs
 
 # ════════════════════════════════════════════════════
 #  MARKET REGIME DETECTOR — IHSG (FIXED)
-#  FIX 1: Tolerance band ±1.2% — jangan RED kalau hampir di EMA20
-#  FIX 2: Momentum factor — naik hari ini = tidak RED
-#  FIX 3: MultiIndex handling yfinance terbaru
 # ════════════════════════════════════════════════════
-@st.cache_data(ttl=300)   # 5 menit — lebih responsif
+@st.cache_data(ttl=300)
 def get_market_regime():
     try:
-        df = yf.download("^JKSE", period="60d", interval="1d",
-                         progress=False, auto_adjust=True, timeout=10)
+        df = _ticker_history("^JKSE", period="60d", interval="1d")
+        if df is None:
+            try:
+                df = yf.download("^JKSE", period="60d", interval="1d",
+                                 progress=False, auto_adjust=True, session=_YF_SESSION)
+                if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.droplevel(-1)
+            except: pass
         if df is None or df.empty or len(df) < 10:
             return ("UNKNOWN", 0, 0, 0, "Data IHSG kurang", 0.0)
-
-        # FIX: handle MultiIndex dari yfinance terbaru
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.droplevel(-1)
+        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.droplevel(-1)
         close = df["Close"].dropna()
-        if isinstance(close, pd.DataFrame):
-            close = close.iloc[:, 0]
-        if len(close) < 10:
-            return ("UNKNOWN", 0, 0, 0, "Data close kurang", 0.0)
-
+        if isinstance(close, pd.DataFrame): close = close.iloc[:, 0]
+        if len(close) < 10: return ("UNKNOWN", 0, 0, 0, "Data close kurang", 0.0)
         ema20 = float(close.ewm(span=20, adjust=False).mean().iloc[-1])
         ema55 = float(close.ewm(span=min(55, len(close)-1), adjust=False).mean().iloc[-1])
         price = float(close.iloc[-1])
         chg   = float(((close.iloc[-1] - close.iloc[-2]) / close.iloc[-2]) * 100)
-
-        # ── Regime logic lebih presisi ──
-        band           = 0.012   # ±1.2% tolerance band
+        band           = 0.012
         pct_vs_e20     = (price - ema20) / ema20 * 100
-        above_e20_any  = price > ema20 * (1 - band)   # dalam band EMA20
-        above_e20_clear= price > ema20 * (1 + band)   # jelas di atas
+        above_e20_any  = price > ema20 * (1 - band)
+        above_e20_clear= price > ema20 * (1 + band)
         above_e55      = price > ema55
-        recovering     = chg > 0.3    # hari ini naik = lagi recovery
-        bearish_confirm= chg < -0.3 and not above_e20_any  # turun + jelas di bawah
-
+        recovering     = chg > 0.3
+        bearish_confirm= chg < -0.3 and not above_e20_any
         if above_e20_clear and above_e55:
-            regime = "GREEN"
-            detail = f"IHSG {price:,.0f} > EMA20 & EMA55 → Bullish ✅ ({pct_vs_e20:+.1f}% vs EMA20)"
+            regime = "GREEN"; detail = f"IHSG {price:,.0f} > EMA20 & EMA55 → Bullish ✅"
         elif above_e20_any and above_e55:
-            regime = "GREEN"
-            detail = f"IHSG {price:,.0f} dekat EMA20({ema20:,.0f}) & > EMA55 → Bullish"
+            regime = "GREEN"; detail = f"IHSG {price:,.0f} dekat EMA20({ema20:,.0f}) & > EMA55"
         elif above_e20_any and not above_e55:
-            regime = "SIDEWAYS"
-            detail = f"IHSG {price:,.0f} > EMA20 tapi < EMA55({ema55:,.0f}) → Sideways"
+            regime = "SIDEWAYS"; detail = f"IHSG {price:,.0f} > EMA20 tapi < EMA55({ema55:,.0f})"
         elif not above_e20_any and recovering:
-            # Di bawah EMA20 TAPI hari ini naik = recovery → SIDEWAYS bukan RED
-            regime = "SIDEWAYS"
-            detail = f"IHSG {price:,.0f} recovery {chg:+.2f}% (EMA20={ema20:,.0f}, gap {pct_vs_e20:+.1f}%)"
+            regime = "SIDEWAYS"; detail = f"IHSG {price:,.0f} recovery {chg:+.2f}%"
         elif bearish_confirm:
-            regime = "RED"
-            detail = f"IHSG {price:,.0f} < EMA20({ema20:,.0f}) {pct_vs_e20:+.1f}% + turun {chg:.2f}% → Bearish"
+            regime = "RED"; detail = f"IHSG {price:,.0f} < EMA20 {pct_vs_e20:+.1f}% + turun {chg:.2f}%"
         else:
-            regime = "SIDEWAYS"
-            detail = f"IHSG {price:,.0f} sedikit < EMA20({ema20:,.0f}) {pct_vs_e20:+.1f}% → Sideways"
-
+            regime = "SIDEWAYS"; detail = f"IHSG {price:,.0f} konsolidasi (EMA20={ema20:,.0f})"
         return (regime, price, ema20, ema55, detail, chg)
     except Exception as e:
         return ("UNKNOWN", 0, 0, 0, f"IHSG error: {str(e)[:40]}", 0.0)
@@ -328,30 +448,25 @@ def get_regime_config(regime):
         "RED": {
             "mode": "Reversal 🎯", "min_score": 5, "min_rvol": 2.0, "sl_mult": 0.6,
             "label": "🔴 MARKET MERAH — Reversal Only, Score ≥ 5",
-            "color": "#ff3d5a",
-            "desc": "Market bearish. Fokus reversal oversold, filter ketat."
+            "color": "#ff3d5a", "desc": "Market bearish. Fokus reversal oversold, filter ketat."
         },
         "GREEN": {
             "mode": "Bagger 💎", "min_score": 4, "min_rvol": 1.5, "sl_mult": 0.8,
             "label": "🟢 MARKET HIJAU — Wyckoff Bagger Hunt (Daily TF)",
-            "color": "#00ff88",
-            "desc": "Market bullish. Cari akumulasi Wyckoff di chart harian. RVOL ≥ 1.5x."
+            "color": "#00ff88", "desc": "Market bullish. Cari akumulasi Wyckoff di chart harian."
         },
         "SIDEWAYS": {
             "mode": "Scalping ⚡", "min_score": 4, "min_rvol": 2.0, "sl_mult": 0.7,
             "label": "🟡 MARKET SIDEWAYS — Scalping, RVOL ≥ 2x",
-            "color": "#ffb700",
-            "desc": "Market sideways. RVOL harus lebih kuat."
+            "color": "#ffb700", "desc": "Market sideways. RVOL harus lebih kuat."
         },
         "UNKNOWN": {
             "mode": "Scalping ⚡", "min_score": 4, "min_rvol": 1.5, "sl_mult": 0.8,
             "label": "⚪ REGIME UNKNOWN — Manual Mode",
-            "color": "#4a5568",
-            "desc": "Tidak bisa deteksi kondisi market."
+            "color": "#4a5568", "desc": "Tidak bisa deteksi kondisi market."
         },
     }.get(regime, {"mode":"Scalping ⚡","min_score":4,"min_rvol":1.5,"sl_mult":0.8,
                    "label":"⚪ UNKNOWN","color":"#4a5568","desc":""})
-
 
 # ════════════════════════════════════════════════════
 #  INDICATORS
@@ -381,9 +496,7 @@ def vwap(df):
     return (tp*df['Volume']).cumsum()/df['Volume'].cumsum()
 
 def apply_indicators(df):
-    """Universal indicator function — works for both 15m and Daily."""
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.droplevel(-1)
+    if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.droplevel(-1)
     df['EMA9']  = ema(df['Close'],9);  df['EMA21'] = ema(df['Close'],21)
     df['EMA50'] = ema(df['Close'],50); df['EMA200']= ema(df['Close'],200)
     df['RSI'], df['RSI_EMA'] = rsi_smooth(df['Close'],14,3)
@@ -415,11 +528,10 @@ def apply_indicators(df):
     df['ATR'] = tr.rolling(14).mean()
     return df
 
-# Legacy alias
-apply_intraday_indicators = apply_indicators
+apply_intraday_indicators = apply_indicators  # legacy alias
 
 # ════════════════════════════════════════════════════
-#  SCORING — Scalping, Momentum, Reversal
+#  SCORING
 # ════════════════════════════════════════════════════
 def score_scalping(r, p, p2):
     score=0; reasons=[]
@@ -475,8 +587,7 @@ def score_reversal(r, p, p2):
     if bp<0.05:   os_count+=1; score+=1;   reasons.append("BB lower touch")
     elif bp<0.15: os_count+=1; score+=0.5
     if os_count<1.5: return 0,[],{}
-    rev=0
-    pk=float(p['STOCH_K']); pd_=float(p['STOCH_D'])
+    rev=0; pk=float(p['STOCH_K']); pd_=float(p['STOCH_D'])
     if sk<30 and sk>sd and pk<=pd_:   rev+=1; score+=2;   reasons.append("STOCH %K cross ↑ OS ✦✦")
     elif sk<25 and sk>sd:             rev+=1; score+=1.2; reasons.append("STOCH K>D extreme OS")
     if p is not None:
@@ -491,142 +602,80 @@ def score_reversal(r, p, p2):
     if float(r['BodyRatio'])>0.75 and float(r['Close'])<float(r['Open']): score-=0.8; reasons.append("⚠️ Bearish bar kuat")
     return max(0,min(6,round(score,1))), reasons, {}
 
-
-# ════════════════════════════════════════════════════
-#  BAGGER DETECTOR — Wyckoff · DAILY TIMEFRAME
-#  Daily TF jauh lebih presisi untuk Wyckoff pattern:
-#  - Sideways 20 bar = ~1 bulan akumulasi nyata
-#  - Dry vol 5 bar = 1 minggu sepi = bandar nyicil
-#  - Spring/breakout lebih valid di daily
-# ════════════════════════════════════════════════════
 def score_bagger(r, p, p2, df_full):
-    score=0; reasons=[]
-    close = float(r['Close'])
-    e9    = float(r['EMA9']);  e21  = float(r['EMA21'])
-    e50   = float(r['EMA50']); e200 = float(r['EMA200'])
-    rvol  = float(r['RVOL'])
-    rsi_e = float(r['RSI_EMA'])
-    wyckoff_phase = "SCANNING"
-
-    # ① PHASE A-B — SIDEWAYS + DRY VOLUME (Daily: 20 hari = ~1 bulan)
-    is_sideways = False
-    range_high  = close * 1.05; range_low = close * 0.95
-    sideways_bars = min(20, len(df_full) - 2)
+    score=0; reasons=[]; close=float(r['Close'])
+    e9=float(r['EMA9']); e21=float(r['EMA21']); e50=float(r['EMA50']); e200=float(r['EMA200'])
+    rvol=float(r['RVOL']); rsi_e=float(r['RSI_EMA']); wyckoff_phase="SCANNING"
+    is_sideways=False; range_high=close*1.05; range_low=close*0.95
+    sideways_bars=min(20,len(df_full)-2)
     try:
-        r_highs    = df_full['High'].iloc[-sideways_bars-1:-1]
-        r_lows     = df_full['Low'].iloc[-sideways_bars-1:-1]
-        range_high = float(r_highs.max())
-        range_low  = float(r_lows.min())
-        range_pct  = (range_high - range_low) / max(range_low, 0.01) * 100
-        # Daily: threshold sedikit lebih longgar (10% vs 8% di 15m)
-        is_sideways = range_pct < 10.0
+        r_highs=df_full['High'].iloc[-sideways_bars-1:-1]; r_lows=df_full['Low'].iloc[-sideways_bars-1:-1]
+        range_high=float(r_highs.max()); range_low=float(r_lows.min())
+        range_pct=(range_high-range_low)/max(range_low,0.01)*100; is_sideways=range_pct<10.0
         if is_sideways:
-            tightness_bonus = max(0, (10.0 - range_pct) / 10.0)
-            score += 1.0 + tightness_bonus * 0.5
-            reasons.append(f"Sideways {range_pct:.1f}% ({sideways_bars} hari) ✦")
-            wyckoff_phase = "A-B"
+            tightness_bonus=max(0,(10.0-range_pct)/10.0); score+=1.0+tightness_bonus*0.5
+            reasons.append(f"Sideways {range_pct:.1f}% ({sideways_bars} hari) ✦"); wyckoff_phase="A-B"
     except: pass
-
-    # Dry Volume: 5 hari terakhir vs MA20 (Daily: 5 hari = 1 minggu)
     try:
-        vol_ma20  = float(df_full['AvgVol'].iloc[-1])
-        vol_last5 = float(df_full['Volume'].iloc[-6:-1].mean())
-        dry_ratio = vol_last5 / max(vol_ma20, 1)
-        if dry_ratio < 0.5 and is_sideways:
-            score += 2.0; reasons.append(f"Dry vol {dry_ratio:.2f}x MA20 — stealth accum ✦✦")
-            wyckoff_phase = "A-B AKUMULASI"
-        elif dry_ratio < 0.7 and is_sideways:
-            score += 1.2; reasons.append(f"Vol drying {dry_ratio:.2f}x MA20 ✦")
-            wyckoff_phase = "A-B AKUMULASI"
-        elif dry_ratio < 0.85 and is_sideways:
-            score += 0.6; reasons.append(f"Vol below avg {dry_ratio:.2f}x")
+        vol_ma20=float(df_full['AvgVol'].iloc[-1]); vol_last5=float(df_full['Volume'].iloc[-6:-1].mean())
+        dry_ratio=vol_last5/max(vol_ma20,1)
+        if dry_ratio<0.5 and is_sideways:   score+=2.0; reasons.append(f"Dry vol {dry_ratio:.2f}x — stealth accum ✦✦"); wyckoff_phase="A-B AKUMULASI"
+        elif dry_ratio<0.7 and is_sideways: score+=1.2; reasons.append(f"Vol drying {dry_ratio:.2f}x ✦"); wyckoff_phase="A-B AKUMULASI"
+        elif dry_ratio<0.85 and is_sideways:score+=0.6; reasons.append(f"Vol below avg {dry_ratio:.2f}x")
     except: pass
-
-    # Stealth Net Buy (Daily: 10 hari = 2 minggu konsisten)
     try:
-        if len(df_full) >= 12:
-            netvols_10   = [float(df_full['NetVol'].iloc[i]) for i in range(-11, -1)]
-            net_positive = sum(1 for v in netvols_10 if v > 0)
-            net_ratio    = net_positive / 10
-            if net_ratio >= 0.7 and is_sideways:
-                score += 1.5; reasons.append(f"Stealth net buy {net_positive}/10 hari ✦✦")
-            elif net_ratio >= 0.6:
-                score += 0.8; reasons.append(f"Net buy {net_positive}/10 hari")
-            elif net_ratio >= 0.5:
-                score += 0.4
+        if len(df_full)>=12:
+            netvols_10=[float(df_full['NetVol'].iloc[i]) for i in range(-11,-1)]
+            net_positive=sum(1 for v in netvols_10 if v>0); net_ratio=net_positive/10
+            if net_ratio>=0.7 and is_sideways:  score+=1.5; reasons.append(f"Stealth net buy {net_positive}/10 hari ✦✦")
+            elif net_ratio>=0.6:                score+=0.8; reasons.append(f"Net buy {net_positive}/10 hari")
+            elif net_ratio>=0.5:                score+=0.4
     except:
         nv3=float(r['NetVol3']); nv8=float(r['NetVol8'])
         if nv3>0 and nv8>0: score+=0.8; reasons.append("Net buyer sustained ✦")
         elif nv3>0:          score+=0.3
-
-    # BB Squeeze (Daily: squeeze selama berminggu-minggu = valid banget)
     try:
-        bb_curr  = float(r['BB_std'])
-        bb_avg10 = float(df_full['BB_std'].iloc[-11:-1].mean())
-        sq_ratio = bb_curr / max(bb_avg10, 0.0001)
-        if sq_ratio < 0.7 and is_sideways:
-            score += 1.5; reasons.append(f"BB squeeze {sq_ratio:.2f}x ✦✦")
-        elif sq_ratio < 0.85:
-            score += 0.8; reasons.append(f"BB squeeze {sq_ratio:.2f}x")
+        bb_curr=float(r['BB_std']); bb_avg10=float(df_full['BB_std'].iloc[-11:-1].mean())
+        sq_ratio=bb_curr/max(bb_avg10,0.0001)
+        if sq_ratio<0.7 and is_sideways:  score+=1.5; reasons.append(f"BB squeeze {sq_ratio:.2f}x ✦✦")
+        elif sq_ratio<0.85:               score+=0.8; reasons.append(f"BB squeeze {sq_ratio:.2f}x")
     except: pass
-
-    # ② SPRING / SHAKEOUT (Daily: lebih valid, bukan noise 15m)
-    spring_detected = False
+    spring_detected=False
     try:
-        lookback_sp = min(15, len(df_full) - 3)
-        prior_lows  = df_full['Low'].iloc[-lookback_sp-2:-2]
-        support     = float(prior_lows.min())
-        bar_low=float(r['Low']); bar_close=float(r['Close']); bar_high=float(r['High'])
-        is_spring   = bar_low < support and bar_close > support
+        lookback_sp=min(15,len(df_full)-3); prior_lows=df_full['Low'].iloc[-lookback_sp-2:-2]
+        support=float(prior_lows.min()); bar_low=float(r['Low']); bar_close=float(r['Close']); bar_high=float(r['High'])
+        is_spring=bar_low<support and bar_close>support
         if is_spring:
-            recovery_strength = (bar_close - bar_low) / max(bar_high - bar_low, 0.0001)
-            if recovery_strength > 0.7 and rvol > 1.2:
-                score += 3.0; reasons.append(f"🔥 SPRING! {recovery_strength:.0%} rebound ✦✦✦")
-                wyckoff_phase = "SPRING ⚡"; spring_detected = True
-            elif recovery_strength > 0.5:
-                score += 1.8; reasons.append(f"Spring ({recovery_strength:.0%} recovery) ✦✦")
-                wyckoff_phase = "SPRING"; spring_detected = True
-        is_post_spring = (float(p['Low']) < support and
-                          float(p['Close']) > support and bar_close > float(p['Close']))
+            recovery_strength=(bar_close-bar_low)/max(bar_high-bar_low,0.0001)
+            if recovery_strength>0.7 and rvol>1.2:
+                score+=3.0; reasons.append(f"🔥 SPRING! {recovery_strength:.0%} rebound ✦✦✦"); wyckoff_phase="SPRING ⚡"; spring_detected=True
+            elif recovery_strength>0.5:
+                score+=1.8; reasons.append(f"Spring ({recovery_strength:.0%}) ✦✦"); wyckoff_phase="SPRING"; spring_detected=True
+        is_post_spring=(float(p['Low'])<support and float(p['Close'])>support and bar_close>float(p['Close']))
         if is_post_spring and not spring_detected:
-            score += 2.0; reasons.append("Post-spring confirmation 🚀 ✦✦")
-            wyckoff_phase = "POST-SPRING"; spring_detected = True
+            score+=2.0; reasons.append("Post-spring confirmation 🚀 ✦✦"); wyckoff_phase="POST-SPRING"; spring_detected=True
     except: pass
-
-    # ③ PHASE D — RVOL SURGE + BREAKOUT (Daily breakout = SANGAT valid)
     try:
-        above_resistance = close > range_high * 0.998
-        thick_body       = float(r['BodyRatio']) > 0.55
-        bull_bar_flag    = float(r['Close']) > float(r['Open'])
-        if rvol > 3.0 and above_resistance and thick_body and bull_bar_flag:
-            score += 3.0; reasons.append(f"🚀 PHASE D! RVOL={rvol:.1f}x daily breakout ✦✦✦")
-            wyckoff_phase = "PHASE D 🚀"
-        elif rvol > 2.0 and above_resistance and bull_bar_flag:
-            score += 2.2; reasons.append(f"Breakout daily RVOL={rvol:.1f}x ✦✦")
-            wyckoff_phase = "BREAKOUT ✦"
-        elif rvol > 1.5 and above_resistance:
-            score += 1.5; reasons.append(f"Breakout attempt RVOL={rvol:.1f}x")
-        elif above_resistance:
-            score += 0.8; reasons.append("Above resistance")
+        above_resistance=close>range_high*0.998; thick_body=float(r['BodyRatio'])>0.55; bull_bar_flag=float(r['Close'])>float(r['Open'])
+        if rvol>3.0 and above_resistance and thick_body and bull_bar_flag:
+            score+=3.0; reasons.append(f"🚀 PHASE D! RVOL={rvol:.1f}x daily breakout ✦✦✦"); wyckoff_phase="PHASE D 🚀"
+        elif rvol>2.0 and above_resistance and bull_bar_flag:
+            score+=2.2; reasons.append(f"Breakout daily RVOL={rvol:.1f}x ✦✦"); wyckoff_phase="BREAKOUT ✦"
+        elif rvol>1.5 and above_resistance: score+=1.5; reasons.append(f"Breakout attempt RVOL={rvol:.1f}x")
+        elif above_resistance:              score+=0.8; reasons.append("Above resistance")
         else:
             if rvol>3.0:   score+=1.2; reasons.append(f"RVOL={rvol:.1f}x SURGE 🔥")
             elif rvol>2.0: score+=0.8; reasons.append(f"RVOL={rvol:.1f}x")
-            elif rvol>1.5: score+=0.4; reasons.append(f"RVOL={rvol:.1f}x")
-            elif rvol<1.0 and wyckoff_phase not in ["A-B AKUMULASI","SPRING","POST-SPRING"]:
-                score -= 0.5
+            elif rvol>1.5: score+=0.4
+            elif rvol<1.0 and wyckoff_phase not in ["A-B AKUMULASI","SPRING","POST-SPRING"]: score-=0.5
     except:
         if rvol>3.0:   score+=1.2; reasons.append(f"RVOL={rvol:.1f}x SURGE 🔥")
         elif rvol>2.0: score+=0.8; reasons.append(f"RVOL={rvol:.1f}x")
         elif rvol>1.5: score+=0.4
-
-    # EMA Structure
     if e9>e21>e50>e200:  score+=1.5; reasons.append("EMA golden stack ✦✦")
     elif e9>e21>e50:     score+=1.0; reasons.append("EMA stack ▲")
     elif e9>e21:         score+=0.4
-    elif is_sideways and wyckoff_phase in ["A-B AKUMULASI","SPRING","POST-SPRING"]:
-        score+=0.2
-
-    # RSI per fase
+    elif is_sideways and wyckoff_phase in ["A-B AKUMULASI","SPRING","POST-SPRING"]: score+=0.2
     if wyckoff_phase in ["A-B","A-B AKUMULASI","SPRING","POST-SPRING"]:
         if 25<=rsi_e<=52:  score+=1.0; reasons.append(f"RSI-EMA={rsi_e:.1f} accum zone ✓")
         elif rsi_e<25:     score+=0.6; reasons.append(f"RSI-EMA={rsi_e:.1f} extreme OS")
@@ -635,25 +684,40 @@ def score_bagger(r, p, p2, df_full):
         if 52<rsi_e<72:   score+=1.0; reasons.append(f"RSI-EMA={rsi_e:.1f} momentum")
         elif rsi_e>=72:   score-=0.5; reasons.append(f"⚠️ RSI OB {rsi_e:.1f}")
         elif rsi_e<40:    score-=0.3
-
     if close>float(r['VWAP']): score+=0.5; reasons.append("Above VWAP")
     if e200>0 and close<e200*0.88: score-=1.0
-
     try:
         if len(df_full)>=4:
             bc=sum(1 for i in range(-3,0) if float(df_full['Close'].iloc[i])>float(df_full['Open'].iloc[i]))
             if bc==3:   score+=0.8; reasons.append("3x consecutive bull bar")
             elif bc==2: score+=0.3
     except: pass
-
-    if wyckoff_phase != "SCANNING":
-        reasons.insert(0, f"⚙️ Wyckoff: {wyckoff_phase}")
-
+    if wyckoff_phase != "SCANNING": reasons.insert(0, f"⚙️ Wyckoff: {wyckoff_phase}")
     return max(0, min(6, round(score, 1))), reasons, {"wyckoff_phase": wyckoff_phase}
 
-# ════════════════════════════════════════════════════
-#  SIGNAL & CARD CLASS
-# ════════════════════════════════════════════════════
+def score_bsjp(r, p, p2):
+    score=0; reasons=[]
+    hi_lo=float(r["High"])-float(r["Low"]); close_pct=(float(r["Close"])-float(r["Low"]))/max(hi_lo,1)
+    if close_pct>0.7:   score+=2;   reasons.append(f"Tutup dekat High ({close_pct:.0%})")
+    elif close_pct>0.5: score+=1;   reasons.append(f"Tutup kuat ({close_pct:.0%})")
+    rvol=float(r["RVOL"])
+    if rvol>3.0:   score+=2;   reasons.append(f"RVOL={rvol:.1f}x SURGE 🔥")
+    elif rvol>2.0: score+=1.5; reasons.append(f"RVOL={rvol:.1f}x kuat")
+    elif rvol>1.5: score+=0.8; reasons.append(f"RVOL={rvol:.1f}x")
+    if r["EMA9"]>r["EMA21"]>r["EMA50"]:  score+=1.5; reasons.append("EMA stack ▲")
+    elif r["EMA9"]>r["EMA21"]:            score+=0.8; reasons.append("EMA9>21")
+    rsi_e=float(r["RSI_EMA"])
+    if 45<rsi_e<70:  score+=1;   reasons.append(f"RSI-EMA={rsi_e:.1f} ✓")
+    elif rsi_e>=70:  score-=1;   reasons.append(f"⚠️ RSI OB {rsi_e:.1f}")
+    elif rsi_e<40:   score+=0.5; reasons.append(f"RSI-EMA={rsi_e:.1f} oversold")
+    if float(r["MACD_Hist"])>0 and float(r["MACD_Hist"])>float(p["MACD_Hist"]):
+        score+=1; reasons.append("MACD hist expanding ✦")
+    elif float(r["MACD_Hist"])>0: score+=0.5; reasons.append("MACD +")
+    if float(r["Close"])>float(r["VWAP"]): score+=0.5; reasons.append("Above VWAP")
+    if float(r["NetVol8"])>0: score+=0.5; reasons.append("Net buyer 8 bar ✦")
+    elif float(r["NetVol3"])>0: score+=0.3
+    return max(0,min(6,round(score,1))), reasons, {}
+
 def get_signal(score, mode):
     t = {
         "Scalping ⚡": {5:"GACOR ⚡",    4:"POTENSIAL 🔥", 3:"WATCH 👀"},
@@ -672,142 +736,51 @@ def get_card_class(signal):
     if "WATCH"  in signal:                         return "watch"
     return ""
 
-
-# ════════════════════════════════════════════════════
-#  BSJP SCORING
-# ════════════════════════════════════════════════════
-def score_bsjp(r, p, p2):
-    score=0; reasons=[]
-    hi_lo     = float(r["High"]) - float(r["Low"])
-    close_pct = (float(r["Close"]) - float(r["Low"])) / max(hi_lo, 1)
-    if close_pct > 0.7:   score+=2;   reasons.append(f"Tutup dekat High ({close_pct:.0%})")
-    elif close_pct > 0.5: score+=1;   reasons.append(f"Tutup kuat ({close_pct:.0%})")
-    rvol = float(r["RVOL"])
-    if rvol > 3.0:   score+=2;   reasons.append(f"RVOL={rvol:.1f}x SURGE 🔥")
-    elif rvol > 2.0: score+=1.5; reasons.append(f"RVOL={rvol:.1f}x kuat")
-    elif rvol > 1.5: score+=0.8; reasons.append(f"RVOL={rvol:.1f}x")
-    if r["EMA9"]>r["EMA21"]>r["EMA50"]:  score+=1.5; reasons.append("EMA stack ▲")
-    elif r["EMA9"]>r["EMA21"]:            score+=0.8; reasons.append("EMA9>21")
-    rsi_e = float(r["RSI_EMA"])
-    if 45<rsi_e<70:  score+=1;   reasons.append(f"RSI-EMA={rsi_e:.1f} ✓")
-    elif rsi_e>=70:  score-=1;   reasons.append(f"⚠️ RSI OB {rsi_e:.1f}")
-    elif rsi_e<40:   score+=0.5; reasons.append(f"RSI-EMA={rsi_e:.1f} oversold")
-    if float(r["MACD_Hist"])>0 and float(r["MACD_Hist"])>float(p["MACD_Hist"]):
-        score+=1; reasons.append("MACD hist expanding ✦")
-    elif float(r["MACD_Hist"])>0:
-        score+=0.5; reasons.append("MACD +")
-    if float(r["Close"])>float(r["VWAP"]): score+=0.5; reasons.append("Above VWAP")
-    if float(r["NetVol8"])>0: score+=0.5; reasons.append("Net buyer 8 bar ✦")
-    elif float(r["NetVol3"])>0: score+=0.3
-    return max(0,min(6,round(score,1))), reasons, {}
-
 # ════════════════════════════════════════════════════
 #  TELEGRAM
 # ════════════════════════════════════════════════════
 def send_telegram(results_top, source="Scanner"):
     if not TOKEN or not CHAT_ID: return
-    now = datetime.now(jakarta_tz); is_open = 9<=now.hour<16
-    sep = "━"*28
-    hdr = (f"{'🔴 MARKET OPEN' if is_open else '🌙 AFTER HOURS'}\n"
-           f"🔥 *THETA TURBO {'WATCHLIST' if source=='Watchlist' else 'ALERT'}*\n"
-           f"⏰ `{now.strftime('%H:%M:%S')} WIB` · `{now.strftime('%d %b %Y')}`\n{sep}\n")
-    body = ""
+    now=datetime.now(jakarta_tz); is_open=9<=now.hour<16
+    sep="━"*28
+    hdr=(f"{'🔴 MARKET OPEN' if is_open else '🌙 AFTER HOURS'}\n"
+         f"🔥 *THETA TURBO {'WATCHLIST' if source=='Watchlist' else 'ALERT'}*\n"
+         f"⏰ `{now.strftime('%H:%M:%S')} WIB` · `{now.strftime('%d %b %Y')}`\n{sep}\n")
+    body=""
     for r in results_top[:5]:
-        sig = r.get('Signal','-')
-        em  = "💎" if "BAGGER" in sig else ("🏆" if ("GACOR" in sig or "REVERSAL" in sig) else ("🔥" if "POTENSIAL" in sig else "👀"))
-        te  = "📈" if "▲" in r.get('Trend','') else ("📉" if "▼" in r.get('Trend','') else "➡️")
-        bar = "█"*int(r['Score'])+"░"*(6-int(r['Score']))
-        tf_label = " [D1]" if r.get("TF","")=="Daily" else " [15M]"
-        body += (f"\n{em} *{r['Ticker']}*  `{sig}`{tf_label}\n"
-                 f"   💰 Price: `{r['Price']:,}` {te}\n"
-                 f"   📊 Score: `[{bar}] {r['Score']}/6`\n"
-                 f"   📈 RSI-EMA: `{r.get('RSI-EMA',0)}` | RVOL: `{r.get('RVOL',0)}x`\n"
-                 f"   🎯 TP: `{r['TP']:,}` | 🛑 SL: `{r['SL']:,}` | R:R `{r['R:R']}`\n"
-                 f"   💡 _{r.get('Reasons','')[:60]}_\n")
-    footer = f"\n{sep}\n⚡ _Theta Turbo v5.2 · Wyckoff Bagger Daily · IDX_\n⚠️ _BUKAN saran investasi. DYOR!_"
+        sig=r.get('Signal','-')
+        em="💎" if "BAGGER" in sig else("🏆" if("GACOR" in sig or "REVERSAL" in sig) else("🔥" if "POTENSIAL" in sig else "👀"))
+        te="📈" if "▲" in r.get('Trend','') else("📉" if "▼" in r.get('Trend','') else "➡️")
+        bar="█"*int(r['Score'])+"░"*(6-int(r['Score']))
+        tf_label=" [D1]" if r.get("TF","")=="Daily" else " [15M]"
+        body+=(f"\n{em} *{r['Ticker']}*  `{sig}`{tf_label}\n"
+               f"   💰 Price: `{r['Price']:,}` {te}\n"
+               f"   📊 Score: `[{bar}] {r['Score']}/6`\n"
+               f"   📈 RSI-EMA: `{r.get('RSI-EMA',0)}` | RVOL: `{r.get('RVOL',0)}x`\n"
+               f"   🎯 TP: `{r['TP']:,}` | 🛑 SL: `{r['SL']:,}` | R:R `{r['R:R']}`\n"
+               f"   💡 _{r.get('Reasons','')[:60]}_\n")
+    footer=f"\n{sep}\n⚡ _Theta Turbo v5.2 · Wyckoff Bagger Daily · IDX_\n⚠️ _BUKAN saran investasi. DYOR!_"
     try:
         requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-                      data={"chat_id":CHAT_ID,"text":hdr+body+footer,"parse_mode":"Markdown"},
-                      timeout=10)
+                      data={"chat_id":CHAT_ID,"text":hdr+body+footer,"parse_mode":"Markdown"},timeout=10)
     except: pass
-
-# ════════════════════════════════════════════════════
-#  DATA FETCH — FIXED (robust yfinance multi-version)
-# ════════════════════════════════════════════════════
-@st.cache_data(ttl=300)
-def fetch_intraday(tickers, chunk=25):
-    """
-    Fetch 15m intraday data.
-    FIX: _yf_extract() handles semua versi yfinance MultiIndex.
-    """
-    all_dfs = {}
-    for i in range(0, len(tickers), chunk):
-        batch = tickers[i:i+chunk]
-        try:
-            raw = yf.download(
-                list(batch), period="5d", interval="15m",
-                group_by='ticker', progress=False,
-                threads=True, auto_adjust=True
-            )
-            for t in batch:
-                try:
-                    df = _yf_extract(raw, t, len(batch))
-                    if df is not None and len(df) >= 50:
-                        all_dfs[t] = df
-                except:
-                    pass
-        except:
-            pass
-        time.sleep(0.3)
-    return all_dfs
-
-@st.cache_data(ttl=600)   # 10 menit — daily data lebih stabil
-def fetch_daily_bagger(tickers, chunk=30):
-    """
-    Fetch 60-hari data DAILY untuk Wyckoff Bagger detection.
-    Daily TF = pattern lebih valid, tidak noise seperti 15m.
-    chunk=30 karena daily jauh lebih ringan dari 15m.
-    """
-    all_dfs = {}
-    for i in range(0, len(tickers), chunk):
-        batch = tickers[i:i+chunk]
-        try:
-            raw = yf.download(
-                list(batch), period="60d", interval="1d",
-                group_by='ticker', progress=False,
-                threads=True, auto_adjust=True
-            )
-            for t in batch:
-                try:
-                    df = _yf_extract(raw, t, len(batch))
-                    # Daily: min 20 bar (1 bulan trading = 20-22 hari)
-                    if df is not None and len(df) >= 20:
-                        all_dfs[t] = df
-                except:
-                    pass
-        except:
-            pass
-        time.sleep(0.2)
-    return all_dfs
 
 # ════════════════════════════════════════════════════
 #  PIVOT POINTS
 # ════════════════════════════════════════════════════
 def calc_pivot_points(high, low, close):
-    pp = (high+low+close)/3
-    r1=2*pp-low; r2=pp+(high-low); r3=high+2*(pp-low)
+    pp=(high+low+close)/3; r1=2*pp-low; r2=pp+(high-low); r3=high+2*(pp-low)
     s1=2*pp-high; s2=pp-(high-low); s3=low-2*(high-pp)
     return {"PP":pp,"R1":r1,"R2":r2,"R3":r3,"S1":s1,"S2":s2,"S3":s3}
 
 @st.cache_data(ttl=3600)
 def fetch_pivot_data(ticker_yf):
     try:
-        raw = yf.download(ticker_yf, period="5d", interval="1d",
-                          progress=False, auto_adjust=True, threads=False)
-        if raw is None or raw.empty or len(raw) < 2: return None
-        df = _yf_extract(raw, ticker_yf, 1)
-        if df is None or len(df) < 2: return None
-        prev = df.iloc[-2]
+        raw=yf.download(ticker_yf,period="5d",interval="1d",progress=False,auto_adjust=True,threads=False,session=_YF_SESSION)
+        if raw is None or raw.empty or len(raw)<2: return None
+        df=_yf_extract(raw,ticker_yf,1)
+        if df is None or len(df)<2: return None
+        prev=df.iloc[-2]
         return calc_pivot_points(float(prev["High"]),float(prev["Low"]),float(prev["Close"]))
     except: return None
 
@@ -822,18 +795,23 @@ def get_pivot_position(price, pivots):
     else:                    return "Below S2 🔴","#ff3d5a"
 
 # ════════════════════════════════════════════════════
-#  MULTI-TIMEFRAME SCORE
+#  MULTI-TIMEFRAME — resample dari 15m, zero extra request
 # ════════════════════════════════════════════════════
 @st.cache_data(ttl=360)
 def fetch_mtf_data(ticker_yf):
-    result = {}
-    for interval,period,key in [("15m","3d","M15"),("1h","10d","H1"),("1d","60d","D1")]:
-        try:
-            raw = yf.download(ticker_yf, period=period, interval=interval,
-                              progress=False, auto_adjust=True, threads=False)
-            df = _yf_extract(raw, ticker_yf, 1)
-            if df is not None and len(df) >= 20: result[key] = df
-        except: pass
+    result={}
+    try:
+        raw=yf.download(ticker_yf,period="7d",interval="15m",progress=False,auto_adjust=True,threads=False,session=_YF_SESSION)
+        df15=_yf_extract(raw,ticker_yf,1)
+        if df15 is None or len(df15)<10: return result
+        if len(df15)>=20: result["M15"]=df15
+        for rs_rule,rs_key,min_b in [("1h","H1",10),("1D","D1",3)]:
+            try:
+                df_rs=df15.resample(rs_rule).agg({"Open":"first","High":"max","Low":"min","Close":"last","Volume":"sum"}).dropna(subset=["Close"])
+                df_rs=df_rs[df_rs["Volume"]>0]
+                if len(df_rs)>=min_b: result[rs_key]=df_rs
+            except: pass
+    except: pass
     return result
 
 def score_mtf(ticker_yf, mode="Scalping ⚡"):
@@ -860,11 +838,10 @@ def mtf_alignment(scores):
     elif bc==1:        return "MIXED ⚠️","#ff7b00",avg
     else:              return "NO ALIGN ❌","#ff3d5a",avg
 
-
 # ════════════════════════════════════════════════════
 #  SEKTOR, GAP UP, TRAILING STOP
 # ════════════════════════════════════════════════════
-SECTORS = {
+SECTORS={
     "Energi & Mining":    ["ADRO","BYAN","ITMG","PTBA","HRUM","DOID","GEMS","PGAS","ELSA","MEDC","ESSA","AKRA","RIGS","DSSA","MBAP","KKGI","MYOH","SMMT","BSSR","INDY"],
     "Perbankan":          ["BBCA","BBRI","BMRI","BBNI","BBTN","BJBR","BJTM","BNGA","BDMN","NISP","MEGA","BBYB","ARTO","BRIS","AGRO","BBHI","NOBU","PNBN","BACA","MAYA"],
     "Properti":           ["BSDE","CTRA","SMRA","LPKR","PWON","APLN","ASRI","DILD","DUTI","MDLN","MKPI","JRPT","KIJA","BEST","GPRA","NUSA","DART","CITY","BKSL","MTLA"],
@@ -875,18 +852,17 @@ SECTORS = {
     "Shipping & Logistik":["TMAS","SMDR","BBRM","NELY","AKSI","SHIP","ELPI","BIRD","GIAA","TAXI","ASSA","WEHA","SAFE","MIRA","HEXA","RAJA","RIGS","MBSS","IATA","BULL"],
     "Petrokimia & Kimia": ["TPIA","BRPT","BUDI","EKAD","INCI","DPNS","ETWA","MDKI","ESSA","AKPI","ADMG","CPRO","SRSN","MOLI","PURA","CEKA","KBLM","JPFA","CPIN","UNIC"],
 }
-HORMUZ_SECTORS = ["Energi & Mining","Shipping & Logistik","Petrokimia & Kimia"]
+HORMUZ_SECTORS=["Energi & Mining","Shipping & Logistik","Petrokimia & Kimia"]
 
 @st.cache_data(ttl=300)
 def fetch_sector_rotation(sector_stocks):
     results=[]; tickers_yf=[s+".JK" for s in sector_stocks[:10]]
     try:
-        raw=yf.download(tickers_yf,period="3d",interval="1d",
-                        group_by="ticker",progress=False,threads=True,auto_adjust=True)
+        raw=yf.download(tickers_yf,period="3d",interval="1d",group_by="ticker",progress=False,threads=False,auto_adjust=True,session=_YF_SESSION)
         for t in tickers_yf:
             tkr=t.replace(".JK","")
             try:
-                df = _yf_extract(raw, t, len(tickers_yf))
+                df=_yf_extract(raw,t,len(tickers_yf))
                 if df is None or len(df)<2: continue
                 close=float(df["Close"].iloc[-1]); prev=float(df["Close"].iloc[-2])
                 chg=(close-prev)/prev*100; vol=float(df["Volume"].iloc[-1])
@@ -899,16 +875,16 @@ def fetch_sector_rotation(sector_stocks):
 @st.cache_data(ttl=3600)
 def calc_sector_beta(sector_name, sector_stocks, lookback=20):
     try:
-        raw_ihsg=yf.download("^JKSE",period="60d",interval="1d",progress=False,auto_adjust=True)
-        ihsg = _yf_extract(raw_ihsg, "^JKSE", 1)
+        raw_ihsg=yf.download("^JKSE",period="60d",interval="1d",progress=False,auto_adjust=True,session=_YF_SESSION)
+        ihsg=_yf_extract(raw_ihsg,"^JKSE",1)
         if ihsg is None or len(ihsg)<lookback: return None
         ihsg_ret=ihsg["Close"].pct_change().dropna()
         tickers_yf=[s+".JK" for s in sector_stocks[:8]]
-        raw=yf.download(tickers_yf,period="60d",interval="1d",group_by="ticker",progress=False,threads=True,auto_adjust=True)
+        raw=yf.download(tickers_yf,period="60d",interval="1d",group_by="ticker",progress=False,threads=False,auto_adjust=True,session=_YF_SESSION)
         sec_rets=[]
         for t in tickers_yf:
             try:
-                df = _yf_extract(raw, t, len(tickers_yf))
+                df=_yf_extract(raw,t,len(tickers_yf))
                 if df is not None: sec_rets.append(df["Close"].pct_change().dropna())
             except: pass
         if not sec_rets: return None
@@ -919,12 +895,9 @@ def calc_sector_beta(sector_name, sector_stocks, lookback=20):
         beta=round(cov/var,2) if var>0 else 1.0; corr=round(aligned["Sektor"].corr(aligned["IHSG"]),2)
         rs5=round((aligned["Sektor"].tail(5).sum()-aligned["IHSG"].tail(5).sum())*100,2)
         ret_1m_sec=round(aligned["Sektor"].tail(20).sum()*100,2)
-        ret_1m_ihsg=round(aligned["IHSG"].tail(20).sum()*100,2)
         down_days=aligned[aligned["IHSG"]<-0.005]
         avg_down=round(down_days["Sektor"].mean()*100,2) if len(down_days)>0 else 0.0
-        return {"sector":sector_name,"beta":beta,"corr":corr,"rs5":rs5,
-                "ret_1m_sec":ret_1m_sec,"ret_1m_ihsg":ret_1m_ihsg,"avg_down":avg_down,
-                "defensive":beta<0.8 and corr<0.7}
+        return {"sector":sector_name,"beta":beta,"corr":corr,"rs5":rs5,"ret_1m_sec":ret_1m_sec,"avg_down":avg_down,"defensive":beta<0.8 and corr<0.7}
     except: return None
 
 def get_beta_label(beta):
@@ -937,15 +910,15 @@ def get_beta_label(beta):
 @st.cache_data(ttl=300)
 def scan_gap_up(tickers_yf, min_gap_pct=0.5):
     results=[]
-    for i in range(0,len(tickers_yf),30):
-        batch=tickers_yf[i:i+30]
+    batches=_random_chunks(list(tickers_yf), min_sz=8, max_sz=20)
+    n_b=len(batches)
+    for bi,batch in enumerate(batches):
         try:
-            raw=yf.download(list(batch),period="5d",interval="1d",
-                            group_by="ticker",progress=False,threads=True,auto_adjust=True)
+            raw=yf.download(list(batch),period="5d",interval="1d",group_by="ticker",progress=False,threads=False,auto_adjust=True,session=_YF_SESSION)
             for t in batch:
                 tkr=t.replace(".JK","")
                 try:
-                    df = _yf_extract(raw, t, len(batch))
+                    df=_yf_extract(raw,t,len(batch))
                     if df is None or len(df)<3: continue
                     today=df.iloc[-1]; prev=df.iloc[-2]
                     close=float(today["Close"]); high_t=float(today["High"]); low_t=float(today["Low"])
@@ -953,8 +926,7 @@ def scan_gap_up(tickers_yf, min_gap_pct=0.5):
                     avg_vol=float(df["Volume"].mean()); rvol=vol/avg_vol if avg_vol>0 else 1.0
                     gap_score=0; reasons=[]
                     if close>high_p:
-                        gap_pct=(close-high_p)/high_p*100
-                        gap_score+=3; reasons.append(f"Gap {gap_pct:.1f}% above prev High ✦✦")
+                        gap_pct=(close-high_p)/high_p*100; gap_score+=3; reasons.append(f"Gap {gap_pct:.1f}% above prev High ✦✦")
                     close_ratio=(close-low_t)/max(high_t-low_t,1)
                     if close_ratio>0.85:   gap_score+=2; reasons.append(f"Tutup dekat High {close_ratio:.0%}")
                     elif close_ratio>0.70: gap_score+=1; reasons.append(f"Tutup kuat {close_ratio:.0%}")
@@ -974,7 +946,7 @@ def scan_gap_up(tickers_yf, min_gap_pct=0.5):
                                     "Reasons":" · ".join(reasons[:3])})
                 except: pass
         except: pass
-        time.sleep(0.2)
+        _human_sleep(bi, n_b)
     return sorted(results,key=lambda x:x["Gap Score"],reverse=True)
 
 def calc_trailing_stop(entry,current,atr,method="ATR",atr_mult=2.0,pct=3.0):
@@ -987,14 +959,12 @@ def calc_trailing_stop(entry,current,atr,method="ATR",atr_mult=2.0,pct=3.0):
             "profit_float":round(profit_pct,2),"profit_locked":round(locked_pct,2),
             "is_profitable":stop_price>entry}
 
-
 # ════════════════════════════════════════════════════
 #  HEADER
 # ════════════════════════════════════════════════════
-regime,ihsg_price,ema20,ema55,regime_detail,ihsg_chg = get_market_regime()
+regime,ihsg_price,ema20,ema55,regime_detail,ihsg_chg=get_market_regime()
 rcfg=get_regime_config(regime); rcolor=rcfg["color"]
-chg_col="#00ff88" if ihsg_chg>=0 else "#ff3d5a"
-chg_sym="▲" if ihsg_chg>=0 else "▼"
+chg_col="#00ff88" if ihsg_chg>=0 else "#ff3d5a"; chg_sym="▲" if ihsg_chg>=0 else "▼"
 now_jkt=datetime.now(jakarta_tz)
 
 st.markdown(f"""
@@ -1024,99 +994,75 @@ st.markdown(f"""
 # ════════════════════════════════════════════════════
 #  TABS
 # ════════════════════════════════════════════════════
-tab_scanner,tab_watchlist,tab_bsjp,tab_sector,tab_gapup,tab_trail,tab_backtest = st.tabs(
-    ["🔥 Scanner","👁️ Watchlist","🌙 BSJP","🏭 Sektor","📈 Gap Up","🎯 Trailing Stop","📊 Backtest"]
-)
+tab_scanner,tab_watchlist,tab_bsjp,tab_sector,tab_gapup,tab_trail,tab_backtest=st.tabs(
+    ["🔥 Scanner","👁️ Watchlist","🌙 BSJP","🏭 Sektor","📈 Gap Up","🎯 Trailing Stop","📊 Backtest"])
 
 # ════════════════════════════════════════════════════
 #  TAB 1: SCANNER
 # ════════════════════════════════════════════════════
 with tab_scanner:
     with st.expander("⚙️  Scanner Settings", expanded=False):
-        sc1,sc2,sc3 = st.columns(3)
+        sc1,sc2,sc3=st.columns(3)
         with sc1:
             st.markdown('<div class="settings-label">MODE SIGNAL</div>',unsafe_allow_html=True)
-            auto_regime = st.toggle("🤖 Auto-Mode (Market Regime)", value=True, key="auto_reg")
+            auto_regime=st.toggle("🤖 Auto-Mode (Market Regime)",value=True,key="auto_reg")
             if auto_regime:
-                scan_mode = rcfg["mode"]
+                scan_mode=rcfg["mode"]
                 st.markdown(f'<div style="font-family:Space Mono,monospace;font-size:10px;padding:6px 10px;background:rgba(0,0,0,.3);border-radius:4px;color:{rcolor};">Auto: {scan_mode}</div>',unsafe_allow_html=True)
             else:
-                # Pakai last active mode sebagai default biar tidak reset ke Scalping
-                _prev = st.session_state.get("active_scan_mode","Scalping ⚡")
-                _opts = ["Scalping ⚡","Momentum 🚀","Reversal 🎯","Bagger 💎"]
-                _idx  = _opts.index(_prev) if _prev in _opts else 0
-                scan_mode = st.radio("Mode", _opts, index=_idx,
-                                     label_visibility="collapsed", key="scan_mode_radio")
-            # Persist ke session_state — penting untuk auto_trigger
-            st.session_state.active_scan_mode   = scan_mode
-            st.session_state.active_auto_regime = auto_regime
-            tele_on = st.toggle("📡 Telegram Alert", value=True, key="tele_on")
+                _prev=st.session_state.get("active_scan_mode","Scalping ⚡")
+                _opts=["Scalping ⚡","Momentum 🚀","Reversal 🎯","Bagger 💎"]
+                _idx=_opts.index(_prev) if _prev in _opts else 0
+                scan_mode=st.radio("Mode",_opts,index=_idx,label_visibility="collapsed",key="scan_mode_radio")
+            st.session_state.active_scan_mode=scan_mode
+            st.session_state.active_auto_regime=auto_regime
+            tele_on=st.toggle("📡 Telegram Alert",value=True,key="tele_on")
         with sc2:
             st.markdown('<div class="settings-label">FILTER</div>',unsafe_allow_html=True)
-            auto_thresh = st.toggle("🤖 Auto-Threshold", value=True, key="auto_thr")
+            auto_thresh=st.toggle("🤖 Auto-Threshold",value=True,key="auto_thr")
             if auto_thresh:
                 min_score=rcfg["min_score"]; vol_thresh=rcfg["min_rvol"]
                 st.caption(f"Auto: Score≥{min_score} · RVOL≥{vol_thresh}x")
             else:
-                min_score  = st.slider("Min Score (0-6)",0,6,4,key="msc")
-                vol_thresh = st.slider("Min RVOL",1.0,5.0,1.5,0.1,key="vol")
-            min_turn = st.number_input("Min Turnover (M Rp)",value=500,step=100,key="trn")*1_000_000
+                min_score=st.slider("Min Score (0-6)",0,6,4,key="msc")
+                vol_thresh=st.slider("Min RVOL",1.0,5.0,1.5,0.1,key="vol")
+            min_turn=st.number_input("Min Turnover (M Rp)",value=500,step=100,key="trn")*1_000_000
         with sc3:
             st.markdown('<div class="settings-label">TAMPILAN</div>',unsafe_allow_html=True)
-            view_mode  = st.radio("View",["Card View 🃏","Table View 📊"],label_visibility="collapsed",key="view_mode")
-            quick_mode = st.toggle("⚡ Quick (200 saham)",value=False,key="quick_mode")
-            is_bagger_mode = (scan_mode == "Bagger 💎")
+            view_mode=st.radio("View",["Card View 🃏","Table View 📊"],label_visibility="collapsed",key="view_mode")
+            quick_mode=st.toggle("⚡ Quick (200 saham)",value=False,key="quick_mode")
+            is_bagger_mode=(scan_mode=="Bagger 💎")
             if is_bagger_mode:
                 st.markdown('<div style="font-family:Space Mono,monospace;font-size:9px;color:#bf5fff;padding:4px 8px;background:rgba(191,95,255,.1);border-radius:4px;">📅 Bagger: Daily TF (60 hari)</div>',unsafe_allow_html=True)
             st.caption(f"🎯 {regime} · {scan_mode} · {len(raw_stocks)} emiten")
 
-    do_scan = st.button("🔥 MULAI SCAN SEKARANG",type="primary",use_container_width=True,key="btn_scan")
-
-    _now_check = datetime.now(jakarta_tz).timestamp()
-    auto_triggered = False
+    do_scan=st.button("🔥 MULAI SCAN SEKARANG",type="primary",use_container_width=True,key="btn_scan")
+    _now_check=datetime.now(jakarta_tz).timestamp(); auto_triggered=False
     if st.session_state.last_scan_time and not do_scan:
         if _now_check-st.session_state.last_scan_time>=300 and st.session_state.scan_results:
             do_scan=True; auto_triggered=True
-            # Pakai mode terakhir yang aktif — bukan default Scalping
-            scan_mode = st.session_state.get("active_scan_mode", scan_mode)
+            scan_mode=st.session_state.get("active_scan_mode",scan_mode)
 
     if do_scan:
-        scan_list  = stocks_yf[:200] if quick_mode else stocks_yf
-        is_bagger  = (scan_mode == "Bagger 💎")
-        prog_ph    = st.empty()
-        pb         = st.progress(0)
-        tf_label   = "📅 DAILY (60 hari)" if is_bagger else "⚡ 15M INTRADAY"
-        label      = "🔄 AUTO-REFRESH" if auto_triggered else "🔥 SCANNING"
-
-        prog_ph.markdown(
-            f'<div style="color:#ff7b00;font-family:Space Mono,monospace;font-size:12px;">'
-            f'{label} {len(scan_list)} saham · {scan_mode} · {tf_label}</div>',
-            unsafe_allow_html=True)
-
+        scan_list=stocks_yf[:200] if quick_mode else stocks_yf
+        is_bagger=(scan_mode=="Bagger 💎")
+        prog_ph=st.empty(); pb=st.progress(0)
+        tf_label="📅 DAILY (60 hari)" if is_bagger else "⚡ 15M INTRADAY"
+        label="🔄 AUTO-REFRESH" if auto_triggered else "🔥 SCANNING"
+        prog_ph.markdown(f'<div style="color:#ff7b00;font-family:Space Mono,monospace;font-size:12px;">{label} {len(scan_list)} saham · {scan_mode} · {tf_label}</div>',unsafe_allow_html=True)
         try:
-            # ── FETCH: pilih TF sesuai mode ──
             if is_bagger:
-                data_dict = fetch_daily_bagger(tuple(scan_list))
+                data_dict=fetch_daily_bagger(tuple(scan_list))
             else:
-                data_dict = fetch_intraday(tuple(scan_list))
-
-            st.session_state.data_dict = data_dict
-            n_fetched = len(data_dict)
-
-            if n_fetched == 0:
+                data_dict=fetch_intraday(tuple(scan_list))
+            st.session_state.data_dict=data_dict; n_fetched=len(data_dict)
+            if n_fetched==0:
                 prog_ph.empty(); pb.empty()
-                st.warning(f"⚠️ Tidak ada data yang berhasil di-fetch. "
-                           f"Coba lagi atau kurangi jumlah saham.")
+                st.warning("⚠️ Tidak ada data. Coba lagi atau kurangi jumlah saham.")
             else:
-                prog_ph.markdown(
-                    f'<div style="color:#00ff88;font-family:Space Mono,monospace;font-size:11px;">'
-                    f'✅ {n_fetched} saham berhasil · Scoring {scan_mode}...</div>',
-                    unsafe_allow_html=True)
-
+                prog_ph.markdown(f'<div style="color:#00ff88;font-family:Space Mono,monospace;font-size:11px;">✅ {n_fetched} saham berhasil · Scoring {scan_mode}...</div>',unsafe_allow_html=True)
                 results=[]; tickers=list(data_dict.keys())
-                # Min bars: daily=20, intraday=55
-                min_bars = 20 if is_bagger else 55
-
+                min_bars=20 if is_bagger else 30
                 for i,ticker_yf in enumerate(tickers):
                     pb.progress((i+1)/max(len(tickers),1))
                     try:
@@ -1126,20 +1072,14 @@ with tab_scanner:
                         r=df.iloc[-1]; p=df.iloc[-2]; p2=df.iloc[-3] if len(df)>=3 else p
                         close=float(r['Close']); vol=float(r['Volume'])
                         turnover=close*vol; rvol=float(r['RVOL'])
-
-                        # Turnover filter: daily vol lebih besar, threshold sama (500M default)
-                        if turnover < min_turn or rvol < vol_thresh: continue
-
-                        # ── Scoring sesuai mode ──
+                        if turnover<min_turn or rvol<vol_thresh: continue
                         if scan_mode=="Scalping ⚡":   sc,reasons,_=score_scalping(r,p,p2)
                         elif scan_mode=="Momentum 🚀": sc,reasons,_=score_momentum(r,p,p2)
                         elif scan_mode=="Bagger 💎":   sc,reasons,_=score_bagger(r,p,p2,df)
                         else:                          sc,reasons,_=score_reversal(r,p,p2)
-
                         if sc<min_score: continue
                         sig=get_signal(sc,scan_mode)
                         if sig=="WAIT": continue
-
                         atr=float(r['ATR']) if not np.isnan(float(r['ATR'])) else close*0.01
                         slm=rcfg.get("sl_mult",0.8)
                         if scan_mode=="Scalping ⚡":   tp=close+1.5*atr; sl=close-slm*atr
@@ -1147,14 +1087,13 @@ with tab_scanner:
                         elif scan_mode=="Bagger 💎":   tp=close+3.0*atr; sl=close-1.0*atr
                         else:                          tp=close+2.5*atr; sl=close-slm*atr
                         rr=(tp-close)/max(close-sl,0.01)
-
                         e9=float(r['EMA9']); e21=float(r['EMA21']); e50=float(r['EMA50'])
                         trend="▲ UP" if e9>e21>e50 else("▼ DOWN" if e9<e21<e50 else"◆ SIDE")
-                        gain_pct = float(r['ROC3'])*100
-
+                        gain_pct=float(r['ROC3'])*100
                         results.append({
                             "Ticker":stock_map.get(ticker_yf,ticker_yf.replace(".JK","")),
-                            "Price":int(close),"Score":sc,"Signal":sig,"Trend":trend,"TF":"Daily" if is_bagger else "15m",
+                            "Price":int(close),"Score":sc,"Signal":sig,"Trend":trend,
+                            "TF":"Daily" if is_bagger else "15m",
                             "RSI-EMA":round(float(r['RSI_EMA']),1),"Stoch K":round(float(r['STOCH_K']),1),
                             "Stoch D":round(float(r['STOCH_D']),1),"MACD Hist":round(float(r['MACD_Hist']),4),
                             "RVOL":round(rvol,2),"BB%":round(float(r['BB_pct']),2),
@@ -1164,12 +1103,10 @@ with tab_scanner:
                             "_class":get_card_class(sig)
                         })
                     except: continue
-
                 prog_ph.empty(); pb.empty()
                 st.session_state.scan_results=results
                 st.session_state.last_scan_time=datetime.now(jakarta_tz).timestamp()
                 st.session_state.last_scan_mode=scan_mode
-
                 if tele_on and results:
                     if 'tt_last_sent' not in st.session_state: st.session_state.tt_last_sent=set()
                     df_tmp=pd.DataFrame(results).sort_values("Score",ascending=False)
@@ -1179,7 +1116,6 @@ with tab_scanner:
                         if top_new: send_telegram(top_new)
                         st.session_state.tt_last_sent.update(new_alr)
                     st.session_state.tt_last_sent=st.session_state.tt_last_sent&cur_set
-
         except Exception as e:
             try: prog_ph.empty(); pb.empty()
             except: pass
@@ -1205,13 +1141,12 @@ with tab_scanner:
         </div>""", unsafe_allow_html=True)
     elif results:
         df_out=pd.DataFrame(results).sort_values("Score",ascending=False).reset_index(drop=True)
-        gacor  =df_out[df_out["Signal"].str.contains("GACOR|REVERSAL",na=False)]
-        bagger =df_out[df_out["Signal"].str.contains("BAGGER|KANDIDAT",na=False)]
+        gacor=df_out[df_out["Signal"].str.contains("GACOR|REVERSAL",na=False)]
+        bagger=df_out[df_out["Signal"].str.contains("BAGGER|KANDIDAT",na=False)]
         potensi=df_out[df_out["Signal"].str.contains("POTENSIAL",na=False)]
         avg_rsi=df_out['RSI-EMA'].mean()
         last_mode=st.session_state.get("last_scan_mode","")
         tf_badge='<span style="font-size:9px;color:#bf5fff;background:rgba(191,95,255,.1);padding:2px 6px;border-radius:3px;">📅 DAILY TF</span>' if last_mode=="Bagger 💎" else '<span style="font-size:9px;color:#00e5ff;background:rgba(0,229,255,.1);padding:2px 6px;border-radius:3px;">⚡ 15M</span>'
-
         st.markdown(f"""
         <div class="metric-row">
           <div class="metric-card" style="border-top-color:{rcolor}"><div class="metric-label">Regime</div>
@@ -1229,15 +1164,12 @@ with tab_scanner:
           <div class="metric-card amber"><div class="metric-label">POTENSIAL</div>
             <div class="metric-value">{len(potensi)}</div></div>
           <div class="metric-card"><div class="metric-label">Avg RSI-EMA</div>
-            <div class="metric-value" style="color:{'#00ff88' if avg_rsi>50 else '#ffb700' if avg_rsi>35 else '#ff3d5a'}">{avg_rsi:.1f}</div>
-            <div class="metric-sub">{'Bullish' if avg_rsi>50 else 'Neutral' if avg_rsi>35 else 'Oversold'}</div></div>
+            <div class="metric-value" style="color:{'#00ff88' if avg_rsi>50 else '#ffb700' if avg_rsi>35 else '#ff3d5a'}">{avg_rsi:.1f}</div></div>
         </div>""", unsafe_allow_html=True)
 
-        # Ticker tape
         th='<div class="tape-wrap"><div class="tape-inner">'
         for _,row in df_out.iterrows():
-            roc=row['ROC 3B%']
-            is_bag="BAGGER" in row['Signal'] or "KANDIDAT" in row['Signal']
+            roc=row['ROC 3B%']; is_bag="BAGGER" in row['Signal'] or "KANDIDAT" in row['Signal']
             cls='bagger' if is_bag else('up' if roc>0 else('down' if roc<0 else'flat'))
             sym='💎' if is_bag else('▲' if roc>0 else('▼' if roc<0 else'─'))
             tf_t="[D]" if row.get("TF","")=="Daily" else "[15M]"
@@ -1246,16 +1178,15 @@ with tab_scanner:
         st.markdown(th, unsafe_allow_html=True)
 
         if not bagger.empty:
-            st.markdown(f'<div class="bagger-alert-box"><div class="bagger-title">💎 WYCKOFF BAGGER ALERT · {len(bagger)} KANDIDAT · DAILY TF</div><div style="font-size:11px;color:#4a5568;margin-top:4px;">Phase A-B (Sideways+Dry Vol) · Spring/Shakeout · Phase D (RVOL+Breakout) — Chart Harian</div></div>',unsafe_allow_html=True)
+            st.markdown(f'<div class="bagger-alert-box"><div class="bagger-title">💎 WYCKOFF BAGGER ALERT · {len(bagger)} KANDIDAT · DAILY TF</div><div style="font-size:11px;color:#4a5568;margin-top:4px;">Phase A-B (Sideways+Dry Vol) · Spring/Shakeout · Phase D (RVOL+Breakout)</div></div>',unsafe_allow_html=True)
         if not gacor.empty:
-            st.markdown(f'<div class="alert-box"><div class="alert-title">🚨 GACOR ALERT · {len(gacor)} SAHAM · {last_mode}</div><div style="font-size:11px;color:#4a5568;margin-top:4px;">Score ≥ 5 · Konfirmasi multi-indikator · R:R optimal</div></div>',unsafe_allow_html=True)
+            st.markdown(f'<div class="alert-box"><div class="alert-title">🚨 GACOR ALERT · {len(gacor)} SAHAM · {last_mode}</div><div style="font-size:11px;color:#4a5568;margin-top:4px;">Score ≥ 5 · Multi-indikator · R:R optimal</div></div>',unsafe_allow_html=True)
 
         if view_mode=="Card View 🃏":
             st.markdown('<div class="section-title">Signal Cards</div>',unsafe_allow_html=True)
             card_html='<div class="signal-grid">'
             for _,row in df_out.head(20).iterrows():
-                sc_int=int(row['Score'])
-                is_bag="BAGGER" in row['Signal'] or "KANDIDAT" in row['Signal']
+                sc_int=int(row['Score']); is_bag="BAGGER" in row['Signal'] or "KANDIDAT" in row['Signal']
                 bar_cls="filled-purple" if is_bag else "filled"
                 bars=''.join([f'<div class="sc-bar {bar_cls if i<sc_int else "empty"}" style="width:28px"></div>' for i in range(6)])
                 roc_c='#00ff88' if row['ROC 3B%']>0 else'#ff3d5a'
@@ -1295,36 +1226,29 @@ with tab_scanner:
         st.dataframe(df_out[display_cols],width='stretch',hide_index=True,column_config={
             "Score":      st.column_config.ProgressColumn("Score",min_value=0,max_value=6,format="%.1f"),
             "RSI-EMA":    st.column_config.NumberColumn("RSI-EMA",format="%.1f"),
-            "Stoch K":    st.column_config.NumberColumn("Stoch K",format="%.1f"),
             "RVOL":       st.column_config.NumberColumn("RVOL",format="%.1fx"),
             "ROC 3B%":    st.column_config.NumberColumn("ROC 3B%",format="%.2f%%"),
             "Turnover(M)":st.column_config.NumberColumn("Turnover(M)",format="Rp%.0fM"),
-            "TF":         st.column_config.TextColumn("TF"),
         })
 
-
 # ════════════════════════════════════════════════════
-#  TAB 2: WATCHLIST (with Bagger Daily support)
+#  TAB 2: WATCHLIST
 # ════════════════════════════════════════════════════
 with tab_watchlist:
-    st.markdown("""<div style="font-family:Space Mono,monospace;font-size:10px;color:#4a5568;margin-bottom:12px;
-         padding:10px 14px;background:#0d1117;border-radius:6px;border-left:3px solid #ff7b00;">
-      Analisa mendalam per saham. Bagger 💎 otomatis pakai <b style="color:#bf5fff">Daily TF</b>.
-    </div>""", unsafe_allow_html=True)
-    wc1,wc2,wc3 = st.columns([3,1,1])
+    st.markdown('<div style="font-family:Space Mono,monospace;font-size:10px;color:#4a5568;margin-bottom:12px;padding:10px 14px;background:#0d1117;border-radius:6px;border-left:3px solid #ff7b00;">Analisa mendalam per saham. Bagger 💎 otomatis pakai <b style="color:#bf5fff">Daily TF</b>.</div>',unsafe_allow_html=True)
+    wc1,wc2,wc3=st.columns([3,1,1])
     with wc1:
-        wl_input = st.text_area("Ticker",placeholder="Contoh:\nBBCA\nARCI, ASSA, GOTO",
-                                height=120,label_visibility="collapsed",key="wl_input")
+        wl_input=st.text_area("Ticker",placeholder="Contoh:\nBBCA\nARCI, ASSA, GOTO",height=120,label_visibility="collapsed",key="wl_input")
     with wc2:
-        wl_mode = st.radio("Mode",["Scalping ⚡","Momentum 🚀","Reversal 🎯","Bagger 💎"],key="wl_mode")
+        wl_mode=st.radio("Mode",["Scalping ⚡","Momentum 🚀","Reversal 🎯","Bagger 💎"],key="wl_mode")
         st.caption(f"Regime suggest: {rcfg['mode']}")
         if wl_mode=="Bagger 💎":
             st.markdown('<div style="font-size:9px;color:#bf5fff;">📅 Pakai Daily TF</div>',unsafe_allow_html=True)
     with wc3:
         st.markdown("<br>",unsafe_allow_html=True)
-        wl_run   = st.button("🔍 Analisa",use_container_width=True,key="wl_run")
-        wl_tele  = st.button("📡 Kirim Telegram",use_container_width=True,key="wl_tele")
-        wl_share = st.button("📋 Copy Hasil",use_container_width=True,key="wl_share")
+        wl_run=st.button("🔍 Analisa",use_container_width=True,key="wl_run")
+        wl_tele=st.button("📡 Kirim Telegram",use_container_width=True,key="wl_tele")
+        wl_share=st.button("📋 Copy Hasil",use_container_width=True,key="wl_share")
 
     if wl_run and wl_input.strip():
         raw_wl=list(dict.fromkeys([t.strip().upper() for line in wl_input.split("\n")
@@ -1335,24 +1259,24 @@ with tab_watchlist:
                 for t in raw_wl:
                     df=None
                     try:
-                        # Bagger: fetch daily, lainnya: 15m
                         if wl_mode=="Bagger 💎":
-                            raw=yf.download(t+".JK",period="60d",interval="1d",
-                                            progress=False,auto_adjust=True,threads=False)
+                            df=_ticker_history(t+".JK","60d","1d")
+                            if df is None:
+                                raw=yf.download(t+".JK",period="60d",interval="1d",progress=False,auto_adjust=True,threads=False,session=_YF_SESSION)
+                                df=_yf_extract(raw,t+".JK",1)
                             min_b=20
                         else:
-                            raw=yf.download(t+".JK",period="5d",interval="15m",
-                                            progress=False,auto_adjust=True,threads=False)
-                            min_b=55
-                        df = _yf_extract(raw, t+".JK", 1)
+                            df=_ticker_history(t+".JK","7d","15m")
+                            if df is None:
+                                raw=yf.download(t+".JK",period="7d",interval="15m",progress=False,auto_adjust=True,threads=False,session=_YF_SESSION)
+                                df=_yf_extract(raw,t+".JK",1)
+                            min_b=30
                         if df is not None and len(df)<min_b: df=None
                     except: pass
-
                     if df is None:
-                        wl_res.append({"Ticker":t,"Price":0,"Score":0,"Signal":"No data",
-                            "RSI-EMA":0,"Stoch K":0,"RVOL":0,"BB%":0,"Trend":"-",
-                            "TP":0,"SL":0,"R:R":0,"ROC 3B%":0,"VWAP":0,"ATR":0,
-                            "Reasons":"No data","_class":"","MACD Hist":0,"TF":"-"}); continue
+                        wl_res.append({"Ticker":t,"Price":0,"Score":0,"Signal":"No data","Trend":"-","TF":"-",
+                            "RSI-EMA":0,"Stoch K":0,"RVOL":0,"BB%":0,"ROC 3B%":0,
+                            "VWAP":0,"TP":0,"SL":0,"R:R":0,"ATR":0,"Reasons":"No data","_class":"","MACD Hist":0}); continue
                     try:
                         df=apply_indicators(df)
                         r=df.iloc[-1]; p=df.iloc[-2]; p2=df.iloc[-3] if len(df)>=3 else p
@@ -1365,28 +1289,53 @@ with tab_watchlist:
                         sig=get_signal(sc,wl_mode); rr=(tp-close)/max(close-sl,0.01)
                         e9=float(r['EMA9']); e21=float(r['EMA21']); e50=float(r['EMA50'])
                         trend="▲ UP" if e9>e21>e50 else("▼ DOWN" if e9<e21<e50 else "◆ SIDE")
-                        _pvt=fetch_pivot_data(t+".JK"); _pvt_pos=get_pivot_position(close,_pvt)[0] if _pvt else "-"
-                        _mtf=score_mtf(t+".JK",mode=wl_mode); _align,_align_col,_avg=mtf_alignment(_mtf)
+                        _pvt=None
+                        try:
+                            if len(df)>=2:
+                                prev=df.iloc[-2]; pp=(float(prev["High"])+float(prev["Low"])+float(prev["Close"]))/3
+                                _pvt={"PP":pp,"R1":2*pp-float(prev["Low"]),"R2":pp+(float(prev["High"])-float(prev["Low"])),"S1":2*pp-float(prev["High"]),"S2":pp-(float(prev["High"])-float(prev["Low"]))}
+                        except: pass
+                        _pvt_pos=get_pivot_position(close,_pvt)[0] if _pvt else "-"
+                        _mtf={}
+                        try:
+                            _df_mtf=apply_indicators(df.copy())
+                            if len(_df_mtf)>=3:
+                                _r=_df_mtf.iloc[-1]; _p=_df_mtf.iloc[-2]; _p2=_df_mtf.iloc[-3]
+                                if wl_mode=="Scalping ⚡":   _sc_m,_,_=score_scalping(_r,_p,_p2)
+                                elif wl_mode=="Momentum 🚀": _sc_m,_,_=score_momentum(_r,_p,_p2)
+                                elif wl_mode=="Bagger 💎":   _sc_m,_,_=score_bagger(_r,_p,_p2,_df_mtf)
+                                else:                         _sc_m,_,_=score_reversal(_r,_p,_p2)
+                                _mtf["M15"]=round(_sc_m,1)
+                                for _rs_rule,_rs_key,_min_b in [("1h","H1",10),("1D","D1",3)]:
+                                    try:
+                                        _df_rs=df.resample(_rs_rule).agg({"Open":"first","High":"max","Low":"min","Close":"last","Volume":"sum"}).dropna(subset=["Close"])
+                                        _df_rs=_df_rs[_df_rs["Volume"]>0]
+                                        if len(_df_rs)>=_min_b:
+                                            _df_rs=apply_indicators(_df_rs)
+                                            _rr=_df_rs.iloc[-1]; _pp=_df_rs.iloc[-2]; _p2r=_df_rs.iloc[-3] if len(_df_rs)>=3 else _pp
+                                            if wl_mode=="Scalping ⚡":   _sc_r,_,_=score_scalping(_rr,_pp,_p2r)
+                                            elif wl_mode=="Momentum 🚀": _sc_r,_,_=score_momentum(_rr,_pp,_p2r)
+                                            elif wl_mode=="Bagger 💎":   _sc_r,_,_=score_bagger(_rr,_pp,_p2r,_df_rs)
+                                            else:                         _sc_r,_,_=score_reversal(_rr,_pp,_p2r)
+                                            _mtf[_rs_key]=round(_sc_r,1)
+                                    except: pass
+                        except: pass
+                        _align,_align_col,_avg=mtf_alignment(_mtf)
                         wl_res.append({"Ticker":t,"Price":int(close),"Score":sc,"Signal":sig,
                             "Trend":trend,"TF":"Daily" if wl_mode=="Bagger 💎" else "15M",
-                            "RSI-EMA":round(float(r['RSI_EMA']),1),
-                            "Stoch K":round(float(r['STOCH_K']),1),"RVOL":round(float(r['RVOL']),2),
-                            "BB%":round(float(r['BB_pct']),2),"ROC 3B%":round(float(r['ROC3'])*100,2),
-                            "VWAP":int(float(r['VWAP'])),"TP":int(tp),"SL":int(sl),"R:R":round(rr,1),
-                            "ATR":round(atr,0),"MACD Hist":round(float(r['MACD_Hist']),4),
-                            "Reasons":" · ".join(reasons),"_class":get_card_class(sig),
-                            "Pivot Pos":_pvt_pos,
-                            "PP":int(_pvt["PP"]) if _pvt else 0,
-                            "R1":int(_pvt["R1"]) if _pvt else 0,
-                            "S1":int(_pvt["S1"]) if _pvt else 0,
-                            "MTF Align":_align,
+                            "RSI-EMA":round(float(r['RSI_EMA']),1),"Stoch K":round(float(r['STOCH_K']),1),
+                            "RVOL":round(float(r['RVOL']),2),"BB%":round(float(r['BB_pct']),2),
+                            "ROC 3B%":round(float(r['ROC3'])*100,2),"VWAP":int(float(r['VWAP'])),
+                            "TP":int(tp),"SL":int(sl),"R:R":round(rr,1),"ATR":round(atr,0),
+                            "MACD Hist":round(float(r['MACD_Hist']),4),"Reasons":" · ".join(reasons),
+                            "_class":get_card_class(sig),"Pivot Pos":_pvt_pos,
+                            "PP":int(_pvt["PP"]) if _pvt else 0,"R1":int(_pvt["R1"]) if _pvt else 0,
+                            "S1":int(_pvt["S1"]) if _pvt else 0,"MTF Align":_align,
                             "M15":_mtf.get("M15",0),"H1":_mtf.get("H1",0),"D1":_mtf.get("D1",0)})
                     except Exception as ex:
                         wl_res.append({"Ticker":t,"Price":0,"Score":0,"Signal":f"Err:{str(ex)[:20]}",
                             "RSI-EMA":0,"Stoch K":0,"RVOL":0,"BB%":0,"Trend":"-","TF":"-",
-                            "TP":0,"SL":0,"R:R":0,"ROC 3B%":0,"VWAP":0,"ATR":0,
-                            "Reasons":"","_class":"","MACD Hist":0})
-
+                            "TP":0,"SL":0,"R:R":0,"ROC 3B%":0,"VWAP":0,"ATR":0,"Reasons":"","_class":"","MACD Hist":0})
             st.session_state.wl_results=wl_res; st.session_state.wl_mode_used=wl_mode
             ok=[r for r in wl_res if r["Score"]>0]
             bag=[r for r in ok if any(k in r.get("Signal","") for k in ["BAGGER","KANDIDAT"])]
@@ -1398,8 +1347,7 @@ with tab_watchlist:
               <div class="metric-card green"><div class="metric-label">GACOR 🔥</div><div class="metric-value">{len(gcr)}</div></div>
               <div class="metric-card amber"><div class="metric-label">POTENSIAL</div><div class="metric-value">{len(pot)}</div></div>
               <div class="metric-card"><div class="metric-label">Data OK</div><div class="metric-value">{len(ok)}</div></div>
-            </div>""", unsafe_allow_html=True)
-
+            </div>""",unsafe_allow_html=True)
             ch='<div class="signal-grid">'
             for row in sorted(wl_res,key=lambda x:x["Score"],reverse=True):
                 if row["Price"]==0:
@@ -1407,7 +1355,7 @@ with tab_watchlist:
                     continue
                 sc_int=int(row["Score"]); bars=''.join([f'<div class="sc-bar {"filled" if i<sc_int else "empty"}" style="width:26px"></div>' for i in range(6)])
                 sig=row.get("Signal","-"); is_bag="BAGGER" in sig or "KANDIDAT" in sig
-                sc_col="#bf5fff" if is_bag else("#00ff88" if ("GACOR" in sig or "REVERSAL" in sig) else("#ffb700" if "POTENSIAL" in sig else "#00e5ff" if "WATCH" in sig else "#4a5568"))
+                sc_col="#bf5fff" if is_bag else("#00ff88" if("GACOR" in sig or "REVERSAL" in sig) else("#ffb700" if "POTENSIAL" in sig else "#00e5ff" if "WATCH" in sig else "#4a5568"))
                 rsi_v=row["RSI-EMA"]; rsi_c="#ff3d5a" if rsi_v<30 else("#ffb700" if rsi_v<45 else "#00ff88" if rsi_v>60 else "#c9d1d9")
                 roc_c="#00ff88" if row.get("ROC 3B%",0)>0 else "#ff3d5a"
                 te="📈" if "▲" in row["Trend"] else("📉" if "▼" in row["Trend"] else "➡️")
@@ -1443,8 +1391,7 @@ with tab_watchlist:
                   </div>
                 </div>"""
             ch+='</div>'
-            st.markdown(ch, unsafe_allow_html=True)
-
+            st.markdown(ch,unsafe_allow_html=True)
             df_wl=pd.DataFrame([r for r in wl_res if r["Price"]>0])
             if not df_wl.empty:
                 show=["Ticker","TF","Price","Score","Signal","Trend","RSI-EMA","Stoch K","RVOL","BB%","ROC 3B%","VWAP","TP","SL","R:R","MTF Align","M15","H1","D1","Pivot Pos","PP","R1","S1","ATR","Reasons"]
@@ -1458,7 +1405,7 @@ with tab_watchlist:
 
     if wl_tele and st.session_state.wl_results:
         to_send=[r for r in st.session_state.wl_results if r["Price"]>0]
-        if to_send: send_telegram(to_send[:5],source="Watchlist"); st.success(f"📡 Terkirim: {min(5,len(to_send))} teratas!")
+        if to_send: send_telegram(to_send[:5],source="Watchlist"); st.success(f"📡 Terkirim!")
 
     if wl_share and st.session_state.wl_results:
         now_str=datetime.now(jakarta_tz).strftime("%d %b %Y %H:%M")
@@ -1467,7 +1414,7 @@ with tab_watchlist:
         for r in sorted(st.session_state.wl_results,key=lambda x:x["Score"],reverse=True):
             if r["Price"]==0: continue
             sig=r.get("Signal","-")
-            em="💎" if ("BAGGER" in sig or "KANDIDAT" in sig) else("🔥" if ("GACOR" in sig or "REVERSAL" in sig) else("⚡" if "POTENSIAL" in sig else "👀"))
+            em="💎" if("BAGGER" in sig or "KANDIDAT" in sig) else("🔥" if("GACOR" in sig or "REVERSAL" in sig) else("⚡" if "POTENSIAL" in sig else "👀"))
             tf_t="[D1]" if r.get("TF","")=="Daily" else "[15M]"
             txt+=f"{em} {r['Ticker']}{tf_t} | {r['Price']:,} | Score:{r['Score']} | RSI:{r['RSI-EMA']} | {sig}\n"
             if r.get("Reasons"): txt+=f"   → {r['Reasons'][:60]}\n"
@@ -1475,20 +1422,17 @@ with tab_watchlist:
         st.text_area("Copy untuk grup:",txt,height=280,key="share_out")
 
     if not st.session_state.wl_results and not wl_run:
-        st.markdown("""<div style="text-align:center;padding:48px;color:#4a5568;font-family:Space Mono,monospace;">
-          <div style="font-size:32px;margin-bottom:12px;">👁️</div>
-          <div style="font-size:12px;letter-spacing:2px;">MASUKKAN TICKER DI ATAS</div>
-          <div style="font-size:10px;margin-top:8px;color:#2d3748;">Bagger 💎 otomatis pakai Daily TF · Lainnya 15M</div>
-        </div>""", unsafe_allow_html=True)
+        st.markdown('<div style="text-align:center;padding:48px;color:#4a5568;font-family:Space Mono,monospace;"><div style="font-size:32px;margin-bottom:12px;">👁️</div><div>MASUKKAN TICKER DI ATAS</div></div>',unsafe_allow_html=True)
 
+# ════════════════════════════════════════════════════
+#  TAB 3: BSJP
+# ════════════════════════════════════════════════════
 with tab_bsjp:
     now_wib=datetime.now(jakarta_tz)
     is_entry_time=(now_wib.hour==14 and now_wib.minute>=30) or (now_wib.hour==15 and now_wib.minute<=45)
-    is_exit_time =(now_wib.hour==9) or (now_wib.hour==10 and now_wib.minute==0)
-
+    is_exit_time=(now_wib.hour==9) or (now_wib.hour==10 and now_wib.minute==0)
     st.markdown(f"""
-    <div style="background:rgba(191,95,255,.08);border:1px solid rgba(191,95,255,.3);
-         border-radius:8px;padding:14px 18px;margin-bottom:16px;">
+    <div style="background:rgba(191,95,255,.08);border:1px solid rgba(191,95,255,.3);border-radius:8px;padding:14px 18px;margin-bottom:16px;">
       <div style="font-family:Space Mono,monospace;font-size:13px;font-weight:700;color:#bf5fff;letter-spacing:1px;">🌙 BELI SORE JUAL PAGI</div>
       <div style="font-family:Space Mono,monospace;font-size:10px;color:#4a5568;margin-top:4px;">
         Entry: <span style="color:#ffb700">14:30 – 15:45 WIB</span> &nbsp;·&nbsp;
@@ -1497,19 +1441,16 @@ with tab_bsjp:
           {'🟢 WAKTU ENTRY!' if is_entry_time else '🟡 WAKTU EXIT!' if is_exit_time else '⏳ Tunggu 14:30 WIB'}
         </span>
       </div>
-    </div>""", unsafe_allow_html=True)
-
+    </div>""",unsafe_allow_html=True)
     bsjp_c1,bsjp_c2=st.columns([2,1])
     with bsjp_c1:
         bsjp_min_score=st.slider("Min BSJP Score",0,6,4,key="bsjp_score")
-        bsjp_min_rvol =st.slider("Min RVOL",1.0,5.0,1.5,0.1,key="bsjp_rvol")
+        bsjp_min_rvol=st.slider("Min RVOL",1.0,5.0,1.5,0.1,key="bsjp_rvol")
     with bsjp_c2:
         bsjp_min_turn=st.number_input("Min Turnover (M Rp)",value=500,step=100,key="bsjp_turn")*1_000_000
-        bsjp_tele    =st.toggle("📡 Telegram Alert",value=True,key="bsjp_tele")
-
+        bsjp_tele=st.toggle("📡 Telegram Alert",value=True,key="bsjp_tele")
     do_bsjp=st.button("🌙 SCAN BSJP SEKARANG",type="primary",use_container_width=True,key="btn_bsjp")
     if "bsjp_results" not in st.session_state: st.session_state.bsjp_results=[]
-
     if do_bsjp:
         bsjp_prog=st.empty(); bsjp_prog.info("🌙 Scanning BSJP candidates...")
         bsjp_res=[]; scan_data=st.session_state.get("data_dict",{})
@@ -1521,7 +1462,7 @@ with tab_bsjp:
             pb_bsjp.progress((i+1)/max(len(tickers_bsjp),1))
             try:
                 df=scan_data[ticker_yf].copy()
-                if len(df)<55: continue
+                if len(df)<30: continue
                 df_copy=apply_indicators(df)
                 r=df_copy.iloc[-1]; p=df_copy.iloc[-2]; p2=df_copy.iloc[-3] if len(df_copy)>=3 else p
                 close=float(r['Close']); vol=float(r['Volume'])
@@ -1533,7 +1474,13 @@ with tab_bsjp:
                 elif sc>=4: bsjp_sig="BUY ⚡"
                 else:       bsjp_sig="WATCH 👀"
                 atr=float(r['ATR']); tp=close+2.0*atr; sl=close-1.0*atr; rr=(tp-close)/max(close-sl,0.01)
-                pvt=fetch_pivot_data(ticker_yf); pvt_pos=get_pivot_position(close,pvt)[0] if pvt else "-"
+                pvt=None
+                try:
+                    if len(df_copy)>=2:
+                        prev=df_copy.iloc[-2]; pp=(float(prev["High"])+float(prev["Low"])+float(prev["Close"]))/3
+                        pvt={"PP":pp,"R1":2*pp-float(prev["Low"]),"R2":pp+(float(prev["High"])-float(prev["Low"])),"S1":2*pp-float(prev["High"]),"S2":pp-(float(prev["High"])-float(prev["Low"]))}
+                except: pass
+                pvt_pos=get_pivot_position(close,pvt)[0] if pvt else "-"
                 e9=float(r['EMA9']); e21=float(r['EMA21']); e50=float(r['EMA50'])
                 trend="▲ UP" if e9>e21>e50 else("▼ DOWN" if e9<e21<e50 else"◆ SIDE")
                 bsjp_res.append({
@@ -1569,7 +1516,7 @@ with tab_bsjp:
     bsjp_results=st.session_state.bsjp_results
     if bsjp_results:
         strong=[r for r in bsjp_results if "STRONG" in r.get("Signal","")]
-        buy   =[r for r in bsjp_results if r.get("Signal","")=="BUY ⚡"]
+        buy=[r for r in bsjp_results if r.get("Signal","")=="BUY ⚡"]
         st.markdown(f"""
         <div class="metric-row">
           <div class="metric-card" style="border-top-color:#bf5fff"><div class="metric-label">Dipindai</div><div class="metric-value">{len(bsjp_results)}</div></div>
@@ -1577,7 +1524,7 @@ with tab_bsjp:
           <div class="metric-card amber"><div class="metric-label">Buy ⚡</div><div class="metric-value">{len(buy)}</div></div>
           <div class="metric-card"><div class="metric-label">Entry</div><div class="metric-value" style="font-size:13px;color:#ffb700">14:30</div></div>
           <div class="metric-card"><div class="metric-label">Exit</div><div class="metric-value" style="font-size:13px;color:#00ff88">09:00</div></div>
-        </div>""", unsafe_allow_html=True)
+        </div>""",unsafe_allow_html=True)
         if len(bsjp_results)>=1:
             medals=["🥇","🥈","🥉"]; cols_top=st.columns(min(3,len(bsjp_results)))
             for idx,col in enumerate(cols_top):
@@ -1585,93 +1532,71 @@ with tab_bsjp:
                 row=bsjp_results[idx]; sig_col="#00ff88" if "STRONG" in row["Signal"] else "#ffb700"
                 with col:
                     st.markdown(f"""
-                    <div style="background:#0d1117;border:1px solid {sig_col}44;border-radius:10px;
-                         padding:16px;text-align:center;border-top:3px solid {sig_col};">
+                    <div style="background:#0d1117;border:1px solid {sig_col}44;border-radius:10px;padding:16px;text-align:center;border-top:3px solid {sig_col};">
                       <div style="font-size:24px">{medals[idx]}</div>
                       <div style="font-family:Space Mono,monospace;font-size:18px;font-weight:700;color:#e6edf3;">{row['Ticker']}</div>
                       <div style="font-family:Space Mono,monospace;font-size:28px;font-weight:700;color:{sig_col};">{row['Score']}</div>
                       <div style="font-size:11px;font-weight:700;color:{sig_col};">{row['Signal']}</div>
-                      <div style="font-family:Space Mono,monospace;font-size:10px;color:#4a5568;margin-top:6px;">
-                        RVOL {row['RVOL']}x · RSI {row['RSI-EMA']}<br>TP {row['TP']:,} · SL {row['SL']:,}
-                      </div>
-                    </div>""", unsafe_allow_html=True)
+                      <div style="font-family:Space Mono,monospace;font-size:10px;color:#4a5568;margin-top:6px;">RVOL {row['RVOL']}x · RSI {row['RSI-EMA']}<br>TP {row['TP']:,} · SL {row['SL']:,}</div>
+                    </div>""",unsafe_allow_html=True)
         df_bsjp=pd.DataFrame(bsjp_results)
         show_cols=["Ticker","Price","Score","Signal","Trend","RSI-EMA","Stoch K","RVOL","TP","SL","R:R","Pivot Pos","PP","R1","S1","Turnover(M)","Reasons"]
         show_cols=[c for c in show_cols if c in df_bsjp.columns]
         st.dataframe(df_bsjp[show_cols],width='stretch',hide_index=True,column_config={
             "Score":st.column_config.ProgressColumn("Score",min_value=0,max_value=6,format="%.1f"),
-            "RVOL": st.column_config.NumberColumn("RVOL",format="%.2fx"),
+            "RVOL":st.column_config.NumberColumn("RVOL",format="%.2fx"),
         })
     elif not do_bsjp:
-        st.markdown("""
-        <div style="text-align:center;padding:48px;color:#4a5568;font-family:Space Mono,monospace;">
-          <div style="font-size:32px;margin-bottom:12px;">🌙</div>
-          <div style="font-size:12px;letter-spacing:2px;">KLIK SCAN BSJP</div>
-          <div style="font-size:10px;margin-top:8px;color:#2d3748;">Best jam 14:00–15:45 WIB</div>
-        </div>""", unsafe_allow_html=True)
+        st.markdown('<div style="text-align:center;padding:48px;color:#4a5568;font-family:Space Mono,monospace;"><div style="font-size:32px;margin-bottom:12px;">🌙</div><div>KLIK SCAN BSJP</div></div>',unsafe_allow_html=True)
 
 # ════════════════════════════════════════════════════
-#  TAB 4: SEKTOR ROTATION
+#  TAB 4: SEKTOR
 # ════════════════════════════════════════════════════
 with tab_sector:
-    st.markdown("""
-    <div style="font-family:Space Mono,monospace;font-size:10px;color:#4a5568;margin-bottom:14px;
-         padding:10px 14px;background:#0d1117;border-radius:6px;border-left:3px solid #ff7b00;">
-      Track pergerakan tiap sektor IDX hari ini. Sektor merah = hindari, hijau = fokus di sana.
-      <br>⚡ <b style="color:#ffb700">Hormuz-sensitive:</b> Energi, Shipping, Petrokimia
-    </div>""", unsafe_allow_html=True)
-    do_sector=st.button("🏭 REFRESH SEKTOR",type="primary",use_container_width=True,key="btn_sector")
+    st.markdown('<div style="font-family:Space Mono,monospace;font-size:10px;color:#4a5568;margin-bottom:14px;padding:10px 14px;background:#0d1117;border-radius:6px;border-left:3px solid #ff7b00;">Track sektor momentum IDX hari ini.</div>',unsafe_allow_html=True)
+    do_sector=st.button("🏭 REFRESH SECTORS",type="primary",use_container_width=True,key="btn_sector")
     if "sector_data" not in st.session_state: st.session_state.sector_data={}
     if do_sector:
-        with st.spinner("Mengambil data sektor..."):
+        with st.spinner("Fetching sector data..."):
             sec_data={}
             for sec_name,sec_stocks in SECTORS.items():
                 results=fetch_sector_rotation(sec_stocks)
                 if results:
-                    avg_chg =sum(r["chg"]  for r in results)/len(results)
+                    avg_chg=sum(r["chg"] for r in results)/len(results)
                     avg_rvol=sum(r["rvol"] for r in results)/len(results)
-                    bullish =sum(1 for r in results if r["chg"]>0)
+                    bullish=sum(1 for r in results if r["chg"]>0)
                     sec_data[sec_name]={"avg_chg":round(avg_chg,2),"avg_rvol":round(avg_rvol,2),
-                                        "bullish":bullish,"total":len(results),
-                                        "stocks":results,"is_hormuz":sec_name in HORMUZ_SECTORS}
+                                        "bullish":bullish,"total":len(results),"stocks":results}
             st.session_state.sector_data=sec_data
     if st.session_state.sector_data:
         sorted_secs=sorted(st.session_state.sector_data.items(),key=lambda x:x[1]["avg_chg"],reverse=True)
-        st.markdown('<div class="section-title">Sektor Heatmap Hari Ini</div>',unsafe_allow_html=True)
+        st.markdown('<div class="section-title">Sector Heatmap</div>',unsafe_allow_html=True)
         cols_sec=st.columns(3)
         for idx,(sec_name,sec_info) in enumerate(sorted_secs):
-            chg=sec_info["avg_chg"]
-            col="#00ff88" if chg>1 else "#ffb700" if chg>0 else "#ff3d5a"
-            bg="rgba(0,255,136,.06)" if chg>1 else "rgba(255,183,0,.06)" if chg>0 else "rgba(255,61,90,.06)"
-            bdr=col+"44"; hormuz_badge=' <span style="color:#ffb700;font-size:9px">⚡HORMUZ</span>' if sec_info["is_hormuz"] else ""
+            chg=sec_info["avg_chg"]; col="#00ff88" if chg>1 else("#ffb700" if chg>0 else "#ff3d5a")
+            bg="rgba(0,255,136,.06)" if chg>1 else("rgba(255,183,0,.06)" if chg>0 else "rgba(255,61,90,.06)")
             bull_pct=int(sec_info["bullish"]/max(sec_info["total"],1)*100)
             with cols_sec[idx%3]:
                 st.markdown(f"""
-                <div style="background:{bg};border:1px solid {bdr};border-radius:8px;padding:12px;margin-bottom:10px;">
-                  <div style="font-family:Space Mono,monospace;font-size:10px;font-weight:700;color:#c9d1d9;">{sec_name}{hormuz_badge}</div>
+                <div style="background:{bg};border:1px solid {col}44;border-radius:8px;padding:12px;margin-bottom:10px;">
+                  <div style="font-family:Space Mono,monospace;font-size:10px;font-weight:700;color:#c9d1d9;">{sec_name}</div>
                   <div style="font-family:Space Mono,monospace;font-size:22px;font-weight:700;color:{col};margin:4px 0;">{chg:+.2f}%</div>
                   <div style="font-size:9px;color:#4a5568;">RVOL avg: {sec_info['avg_rvol']:.1f}x · Bullish: {sec_info['bullish']}/{sec_info['total']} ({bull_pct}%)</div>
                   <div style="height:4px;background:#1c2533;border-radius:2px;margin-top:6px;overflow:hidden;">
                     <div style="width:{bull_pct}%;height:100%;background:{col};border-radius:2px;"></div>
                   </div>
-                </div>""", unsafe_allow_html=True)
-        st.markdown('<div class="section-title">Top Saham Per Sektor Terkuat</div>',unsafe_allow_html=True)
-        top3_secs=sorted_secs[:3]; cols_top=st.columns(3)
-        for cidx,(sec_name,sec_info) in enumerate(top3_secs):
+                </div>""",unsafe_allow_html=True)
+        top3=sorted_secs[:3]; cols_top=st.columns(3)
+        for cidx,(sec_name,sec_info) in enumerate(top3):
             with cols_top[cidx]:
                 chg=sec_info["avg_chg"]; col="#00ff88" if chg>0 else "#ff3d5a"
                 st.markdown(f'<div style="font-family:Space Mono,monospace;font-size:11px;color:{col};font-weight:700;margin-bottom:8px;">{sec_name}</div>',unsafe_allow_html=True)
                 for stk in sorted(sec_info["stocks"],key=lambda x:x["chg"],reverse=True)[:5]:
                     sc="#00ff88" if stk["chg"]>0 else "#ff3d5a"
-                    st.markdown(f"""
-                    <div style="display:flex;justify-content:space-between;padding:5px 0;
-                         border-bottom:1px solid #1c2533;font-family:Space Mono,monospace;font-size:10px;">
-                      <span style="color:#c9d1d9;">{stk['ticker']}</span>
-                      <span style="color:{sc}">{stk['chg']:+.1f}%</span>
-                      <span style="color:#4a5568;">RVOL {stk['rvol']}x</span>
-                    </div>""", unsafe_allow_html=True)
-    st.markdown('<div class="section-title" style="margin-top:24px;">Beta & Relative Strength vs IHSG</div>',unsafe_allow_html=True)
-    do_beta=st.button("🔬 Hitung Beta Semua Sektor",use_container_width=True,key="btn_beta")
+                    st.markdown(f'<div style="display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid #1c2533;font-family:Space Mono,monospace;font-size:10px;"><span style="color:#c9d1d9;">{stk["ticker"]}</span><span style="color:{sc}">{stk["chg"]:+.1f}%</span><span style="color:#4a5568;">RVOL {stk["rvol"]}x</span></div>',unsafe_allow_html=True)
+
+    st.markdown('<div class="section-title" style="margin-top:24px;">Beta vs IHSG</div>',unsafe_allow_html=True)
+    do_beta=st.button("🔬 Calculate Beta All Sectors",use_container_width=True,key="btn_beta")
     if "beta_data" not in st.session_state: st.session_state.beta_data=[]
     if do_beta:
         beta_res=[]; bp=st.progress(0); secs=list(SECTORS.items())
@@ -1685,69 +1610,48 @@ with tab_sector:
         for b in st.session_state.beta_data:
             beta_lbl,beta_col=get_beta_label(b["beta"])
             rs_col="#00ff88" if b["rs5"]>0 else "#ff3d5a"
-            down_col="#00ff88" if b["avg_down"]>0 else "#ff3d5a"
-            hormuz=" ⚡" if b["sector"] in HORMUZ_SECTORS else ""
             width=min(100,int(abs(b["beta"])*50))
             st.markdown(f"""
-            <div style="background:#0d1117;border:1px solid #1c2533;border-radius:8px;
-                 padding:12px 16px;margin-bottom:8px;border-left:4px solid {beta_col};">
+            <div style="background:#0d1117;border:1px solid #1c2533;border-radius:8px;padding:12px 16px;margin-bottom:8px;border-left:4px solid {beta_col};">
               <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
-                <div style="flex:2;">
-                  <div style="font-family:Space Mono,monospace;font-size:11px;font-weight:700;color:#c9d1d9;">{b['sector']}{hormuz}</div>
-                  <div style="font-family:Space Mono,monospace;font-size:9px;color:#4a5568;margin-top:2px;">Korrelasi: {b['corr']} · 1M Return: {b['ret_1m_sec']:+.1f}%</div>
-                </div>
-                <div style="text-align:center;min-width:80px;">
-                  <div style="font-family:Space Mono,monospace;font-size:20px;font-weight:700;color:{beta_col};">{b['beta']}</div>
-                  <div style="font-size:9px;color:{beta_col};">{beta_lbl}</div>
-                </div>
-                <div style="text-align:center;min-width:80px;">
-                  <div style="font-family:Space Mono,monospace;font-size:14px;font-weight:700;color:{rs_col};">{b['rs5']:+.1f}%</div>
-                  <div style="font-size:9px;color:#4a5568;">RS 5 Hari</div>
-                </div>
-                <div style="text-align:center;min-width:80px;">
-                  <div style="font-family:Space Mono,monospace;font-size:14px;font-weight:700;color:{down_col};">{b['avg_down']:+.2f}%</div>
-                  <div style="font-size:9px;color:#4a5568;">Avg saat IHSG ↓</div>
-                </div>
+                <div style="flex:2;"><div style="font-family:Space Mono,monospace;font-size:11px;font-weight:700;color:#c9d1d9;">{b['sector']}</div>
+                  <div style="font-family:Space Mono,monospace;font-size:9px;color:#4a5568;">Corr: {b['corr']} · 1M: {b['ret_1m_sec']:+.1f}%</div></div>
+                <div style="text-align:center;min-width:80px;"><div style="font-family:Space Mono,monospace;font-size:20px;font-weight:700;color:{beta_col};">{b['beta']}</div>
+                  <div style="font-size:9px;color:{beta_col};">{beta_lbl}</div></div>
+                <div style="text-align:center;min-width:80px;"><div style="font-family:Space Mono,monospace;font-size:14px;font-weight:700;color:{rs_col};">{b['rs5']:+.1f}%</div>
+                  <div style="font-size:9px;color:#4a5568;">RS 5 Days</div></div>
               </div>
               <div style="height:4px;background:#1c2533;border-radius:2px;margin-top:10px;overflow:hidden;">
                 <div style="width:{width}%;height:100%;background:{beta_col};border-radius:2px;"></div>
               </div>
-            </div>""", unsafe_allow_html=True)
+            </div>""",unsafe_allow_html=True)
     if not st.session_state.sector_data:
-        st.markdown("""
-        <div style="text-align:center;padding:48px;color:#4a5568;font-family:Space Mono,monospace;">
-          <div style="font-size:32px;margin-bottom:12px;">🏭</div>
-          <div style="font-size:12px;letter-spacing:2px;">KLIK REFRESH SEKTOR</div>
-        </div>""", unsafe_allow_html=True)
+        st.markdown('<div style="text-align:center;padding:48px;color:#4a5568;font-family:Space Mono,monospace;"><div style="font-size:32px;margin-bottom:12px;">🏭</div><div>KLIK REFRESH SECTORS</div></div>',unsafe_allow_html=True)
 
 # ════════════════════════════════════════════════════
-#  TAB 5: GAP UP SCANNER
+#  TAB 5: GAP UP
 # ════════════════════════════════════════════════════
 with tab_gapup:
-    st.markdown("""
-    <div style="font-family:Space Mono,monospace;font-size:10px;color:#4a5568;margin-bottom:14px;
-         padding:10px 14px;background:#0d1117;border-radius:6px;border-left:3px solid #00ff88;">
-      Deteksi saham yang berpotensi <b style="color:#00ff88">Gap Up besok pagi</b> (09:00-10:00 WIB).
-    </div>""", unsafe_allow_html=True)
+    st.markdown('<div style="font-family:Space Mono,monospace;font-size:10px;color:#4a5568;margin-bottom:14px;padding:10px 14px;background:#0d1117;border-radius:6px;border-left:3px solid #00ff88;">Deteksi saham IDX berpotensi <b style="color:#00ff88">Gap Up</b> besok pagi.</div>',unsafe_allow_html=True)
     gu_c1,gu_c2=st.columns(2)
     with gu_c1: gu_min_score=st.slider("Min Gap Score",1,6,3,key="gu_score")
     with gu_c2: gu_quick=st.toggle("⚡ Quick Scan (200)",value=True,key="gu_quick")
-    do_gapup=st.button("📈 SCAN GAP UP SEKARANG",type="primary",use_container_width=True,key="btn_gapup")
+    do_gapup=st.button("📈 SCAN GAP UP",type="primary",use_container_width=True,key="btn_gapup")
     if "gapup_results" not in st.session_state: st.session_state.gapup_results=[]
     if do_gapup:
         scan_tickers=stocks_yf[:200] if gu_quick else stocks_yf
-        with st.spinner(f"Scanning {len(scan_tickers)} saham untuk Gap Up..."):
+        with st.spinner(f"Scanning {len(scan_tickers)} saham..."):
             gu_res=scan_gap_up(scan_tickers)
             gu_res=[r for r in gu_res if r["Gap Score"]>=gu_min_score]
             st.session_state.gapup_results=gu_res
         if gu_res and TOKEN and CHAT_ID:
             now_g=datetime.now(jakarta_tz); sep="━"*28
-            msg=f"📈 *GAP UP SCANNER*\n⏰ `{now_g.strftime('%H:%M:%S')} WIB`\n{sep}\n"
+            msg=f"📈 *GAP UP SCANNER IDX*\n⏰ `{now_g.strftime('%H:%M:%S')} WIB`\n{sep}\n"
             for r in gu_res[:5]:
                 msg+=(f"\n🚀 *{r['Ticker']}* `{r['Signal']}`\n"
                       f"   💰 Price: `{r['Price']:,}` ({r['Chg %']:+.1f}%)\n"
                       f"   📊 Gap Score: `{r['Gap Score']}/6`\n"
-                      f"   🌊 RVOL: `{r['RVOL']}x`\n   💡 _{r['Reasons'][:50]}_\n")
+                      f"   🌊 RVOL: `{r['RVOL']}x`\n💡 _{r['Reasons'][:50]}_\n")
             msg+=f"\n{sep}\n⚠️ _BUKAN saran investasi!_"
             try:
                 requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage",
@@ -1757,27 +1661,23 @@ with tab_gapup:
     gapup_res=st.session_state.gapup_results
     if gapup_res:
         gap_confirmed=[r for r in gapup_res if "GAP UP" in r.get("Signal","")]
-        potential    =[r for r in gapup_res if "POTENTIAL" in r.get("Signal","")]
-        st.markdown(f"""
-        <div class="metric-row">
+        potential=[r for r in gapup_res if "POTENTIAL" in r.get("Signal","")]
+        st.markdown(f"""<div class="metric-row">
           <div class="metric-card green"><div class="metric-label">Gap Confirmed 🚀</div><div class="metric-value">{len(gap_confirmed)}</div></div>
           <div class="metric-card amber"><div class="metric-label">Potential ⚡</div><div class="metric-value">{len(potential)}</div></div>
           <div class="metric-card"><div class="metric-label">Total</div><div class="metric-value">{len(gapup_res)}</div></div>
-        </div>""", unsafe_allow_html=True)
+        </div>""",unsafe_allow_html=True)
         gu_html='<div class="signal-grid">'
         for row in gapup_res[:20]:
-            sc_int=int(min(row["Gap Score"],6))
-            bars=''.join([f'<div class="sc-bar {"filled" if i<sc_int else "empty"}" style="width:26px"></div>' for i in range(6)])
+            sc_int=int(min(row["Gap Score"],6)); bars=''.join([f'<div class="sc-bar {"filled" if i<sc_int else "empty"}" style="width:26px"></div>' for i in range(6)])
             is_gap="GAP UP" in row.get("Signal",""); sc_col="#00ff88" if is_gap else "#ffb700"
             chg_c="#00ff88" if row["Chg %"]>0 else "#ff3d5a"
             gu_html+=f"""<div class="signal-card {'gacor' if is_gap else 'potensial'}">
               <div style="display:flex;justify-content:space-between;">
                 <div><div class="sc-ticker">{row['Ticker']}</div>
                 <div class="sc-price" style="color:{chg_c}">{row['Price']:,} ({row['Chg %']:+.1f}%)</div></div>
-                <div style="text-align:right">
-                  <div style="font-family:Space Mono,monospace;font-size:9px;color:#4a5568">GAP SCORE</div>
-                  <div style="font-family:Space Mono,monospace;font-size:22px;font-weight:700;color:{sc_col}">{row['Gap Score']}</div>
-                </div>
+                <div style="text-align:right"><div style="font-family:Space Mono,monospace;font-size:9px;color:#4a5568">GAP SCORE</div>
+                <div style="font-family:Space Mono,monospace;font-size:22px;font-weight:700;color:{sc_col}">{row['Gap Score']}</div></div>
               </div>
               <div class="sc-signal" style="color:{sc_col}">{row['Signal']}</div>
               <div class="sc-bars">{bars}</div>
@@ -1789,48 +1689,42 @@ with tab_gapup:
               <div style="margin-top:8px;font-size:10px;color:#4a5568;font-family:Space Mono,monospace;">{row['Reasons'][:80]}</div>
             </div>"""
         gu_html+='</div>'
-        st.markdown(gu_html, unsafe_allow_html=True)
+        st.markdown(gu_html,unsafe_allow_html=True)
         df_gu=pd.DataFrame(gapup_res)
-        st.dataframe(df_gu,width='stretch',hide_index=True,
-                     column_config={"Gap Score":st.column_config.ProgressColumn("Gap Score",min_value=0,max_value=6,format="%.1f"),
-                                    "RVOL":st.column_config.NumberColumn("RVOL",format="%.2fx"),
-                                    "Chg %":st.column_config.NumberColumn("Chg %",format="%.2f%%")})
+        st.dataframe(df_gu,width='stretch',hide_index=True,column_config={
+            "Gap Score":st.column_config.ProgressColumn("Gap Score",min_value=0,max_value=6,format="%.1f"),
+            "RVOL":st.column_config.NumberColumn("RVOL",format="%.2fx"),
+            "Chg %":st.column_config.NumberColumn("Chg %",format="%.2f%%"),
+        })
     elif not do_gapup:
-        st.markdown("""
-        <div style="text-align:center;padding:48px;color:#4a5568;font-family:Space Mono,monospace;">
-          <div style="font-size:32px;margin-bottom:12px;">📈</div>
-          <div style="font-size:12px;letter-spacing:2px;">KLIK SCAN GAP UP</div>
-        </div>""", unsafe_allow_html=True)
+        st.markdown('<div style="text-align:center;padding:48px;color:#4a5568;font-family:Space Mono,monospace;"><div style="font-size:32px;margin-bottom:12px;">📈</div><div>KLIK SCAN GAP UP</div></div>',unsafe_allow_html=True)
 
 # ════════════════════════════════════════════════════
-#  TAB 6: TRAILING STOP ENGINE
+#  TAB 6: TRAILING STOP
 # ════════════════════════════════════════════════════
 with tab_trail:
-    st.markdown("""
-    <div style="font-family:Space Mono,monospace;font-size:10px;color:#4a5568;margin-bottom:14px;
-         padding:10px 14px;background:#0d1117;border-radius:6px;border-left:3px solid #bf5fff;">
-      Lock profit di market bullish. ATR 2x = scalping · ATR 3x = swing/BSJP.
-    </div>""", unsafe_allow_html=True)
+    st.markdown('<div style="font-family:Space Mono,monospace;font-size:10px;color:#4a5568;margin-bottom:14px;padding:10px 14px;background:#0d1117;border-radius:6px;border-left:3px solid #bf5fff;">Lock profit. ATR 2x = scalping · ATR 3x = swing · Persen = fixed trail.</div>',unsafe_allow_html=True)
     tr_c1,tr_c2=st.columns(2)
     with tr_c1:
         st.markdown('<div class="settings-label">POSISI LO</div>',unsafe_allow_html=True)
-        tr_ticker=st.text_input("Ticker (tanpa .JK)",value="BBCA",key="tr_ticker").upper()
-        tr_entry =st.number_input("Harga Entry (Rp)",value=9000,step=10,key="tr_entry")
-        tr_qty   =st.number_input("Jumlah Lot",value=10,step=1,key="tr_qty")
+        tr_ticker=st.text_input("Ticker IDX (tanpa .JK)",value="BBCA",key="tr_ticker").upper()
+        tr_entry=st.number_input("Harga Entry (Rp)",value=9000,step=50,key="tr_entry")
+        tr_qty=st.number_input("Lot (1 lot=100 lembar)",value=10,step=1,key="tr_qty")
     with tr_c2:
-        st.markdown('<div class="settings-label">SETTING TRAILING</div>',unsafe_allow_html=True)
-        tr_method=st.radio("Metode",["ATR","Persen","Swing Low"],key="tr_method")
+        st.markdown('<div class="settings-label">TRAILING SETTINGS</div>',unsafe_allow_html=True)
+        tr_method=st.radio("Method",["ATR","Persen","Swing Low"],key="tr_method")
         if tr_method=="ATR":      tr_atr_mult=st.slider("ATR Multiplier",1.0,5.0,2.0,0.5,key="tr_atr_m")
         elif tr_method=="Persen": tr_pct=st.slider("Trailing %",1.0,10.0,3.0,0.5,key="tr_pct")
-        tr_alert=st.toggle("🔔 Alert Telegram",value=True,key="tr_alert")
-    if st.button("🎯 HITUNG TRAILING STOP",type="primary",use_container_width=True,key="btn_trail"):
-        with st.spinner(f"Fetch data {tr_ticker}..."):
+        tr_alert=st.toggle("🔔 Telegram Alert",value=True,key="tr_alert")
+    if st.button("🎯 CALCULATE TRAILING STOP",type="primary",use_container_width=True,key="btn_trail"):
+        with st.spinner(f"Fetching {tr_ticker}..."):
             try:
-                raw_tr=yf.download(tr_ticker+".JK",period="5d",interval="15m",
-                                   progress=False,auto_adjust=True,threads=False)
-                if df_tr is not None:
-                    if isinstance(raw_tr.columns,pd.MultiIndex): raw_tr.columns=raw_tr.columns.droplevel(1)
-                    df_tr=apply_indicators(raw_tr.dropna())
+                df_tr=_ticker_history(tr_ticker+".JK","7d","15m")
+                if df_tr is None:
+                    raw_tr=yf.download(tr_ticker+".JK",period="7d",interval="15m",progress=False,auto_adjust=True,threads=False,session=_YF_SESSION)
+                    df_tr=_yf_extract(raw_tr,tr_ticker+".JK",1)
+                if df_tr is not None and len(df_tr)>=20:
+                    df_tr=apply_indicators(df_tr)
                     current=float(df_tr["Close"].iloc[-1]); atr_val=float(df_tr["ATR"].iloc[-1])
                     if tr_method=="ATR":      trail_result=calc_trailing_stop(tr_entry,current,atr_val,"ATR",tr_atr_mult)
                     elif tr_method=="Persen": trail_result=calc_trailing_stop(tr_entry,current,atr_val,"Persen",pct=tr_pct)
@@ -1838,44 +1732,44 @@ with tab_trail:
                     stop=trail_result["stop"]; dist=trail_result["distance"]
                     p_float=trail_result["profit_float"]; p_locked=trail_result["profit_locked"]
                     is_profit=trail_result["is_profitable"]
-                    lot_val=tr_qty*100; profit_rp=(current-tr_entry)*lot_val; locked_rp=max(0,(stop-tr_entry)*lot_val)
+                    profit_rp=(current-tr_entry)*tr_qty*100; locked_rp=max(0,(stop-tr_entry)*tr_qty*100)
                     stop_col="#00ff88" if is_profit else "#ff3d5a"; profit_col="#00ff88" if profit_rp>=0 else "#ff3d5a"
                     st.markdown(f"""
                     <div style="background:#0d1117;border:1px solid {stop_col}44;border-radius:10px;padding:20px;margin-top:12px;">
                       <div class="metric-row">
                         <div class="metric-card"><div class="metric-label">Harga Sekarang</div>
-                          <div class="metric-value" style="color:#00e5ff">{int(current):,}</div>
-                          <div class="metric-sub">ATR: {int(atr_val)}</div></div>
+                          <div class="metric-value" style="color:#00e5ff">{current:,.0f}</div>
+                          <div class="metric-sub">ATR: {atr_val:,.0f}</div></div>
                         <div class="metric-card" style="border-top-color:{stop_col}">
                           <div class="metric-label">🎯 Trailing Stop</div>
-                          <div class="metric-value" style="color:{stop_col}">{int(stop):,}</div>
-                          <div class="metric-sub">Jarak: {int(dist):,}</div></div>
+                          <div class="metric-value" style="color:{stop_col}">{stop:,.0f}</div>
+                          <div class="metric-sub">Distance: {dist:,.0f}</div></div>
                         <div class="metric-card" style="border-top-color:{profit_col}">
-                          <div class="metric-label">Profit Float</div>
+                          <div class="metric-label">Float P&L</div>
                           <div class="metric-value" style="color:{profit_col}">{p_float:+.1f}%</div>
                           <div class="metric-sub">Rp {profit_rp:,.0f}</div></div>
                         <div class="metric-card" style="border-top-color:#00ff88">
-                          <div class="metric-label">Profit Terkunci 🔒</div>
+                          <div class="metric-label">Locked 🔒</div>
                           <div class="metric-value" style="color:#00ff88">{p_locked:+.1f}%</div>
                           <div class="metric-sub">Rp {locked_rp:,.0f}</div></div>
                       </div>
                       <div style="margin-top:12px;font-family:Space Mono,monospace;font-size:10px;color:#4a5568;">
-                        💼 {tr_qty} lot ({lot_val:,} lembar) · {'✅ Profit terkunci!' if is_profit else '⚠️ Stop di bawah entry'}
+                        💼 {tr_qty} lot · {'✅ Profit terkunci!' if is_profit else '⚠️ Stop di bawah entry'}
                       </div>
-                    </div>""", unsafe_allow_html=True)
+                    </div>""",unsafe_allow_html=True)
                     if tr_alert and TOKEN and CHAT_ID:
                         now_tr=datetime.now(jakarta_tz)
                         msg_tr=(f"🎯 *TRAILING STOP UPDATE*\n⏰ `{now_tr.strftime('%H:%M:%S')} WIB`\n{'━'*28}\n"
-                                f"📌 *{tr_ticker}* | {tr_method}\n💰 Entry: `{tr_entry:,}` → Now: `{int(current):,}`\n"
-                                f"🎯 Stop: `{int(stop):,}` | Locked: `{p_locked:+.1f}%` (Rp {locked_rp:,.0f})\n"
+                                f"📌 *{tr_ticker}* | {tr_method}\n💰 Entry: `{tr_entry:,}` → Now: `{current:,.0f}`\n"
+                                f"🎯 Stop: `{stop:,.0f}` | Locked: `{p_locked:+.1f}%` (Rp {locked_rp:,.0f})\n"
                                 f"📊 Float: `{p_float:+.1f}%` (Rp {profit_rp:,.0f})\n{'━'*28}\n⚠️ _BUKAN saran investasi!_")
                         try:
                             requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage",
                                           data={"chat_id":CHAT_ID,"text":msg_tr,"parse_mode":"Markdown"},timeout=10)
-                            st.success("📡 Trailing stop terkirim!")
+                            st.success("📡 Alert terkirim!")
                         except: pass
                 else:
-                    st.error(f"Data {tr_ticker} tidak tersedia")
+                    st.error(f"Data {tr_ticker} tidak tersedia. Coba lagi.")
             except Exception as ex:
                 st.error(f"Error: {str(ex)[:80]}")
 
@@ -1885,23 +1779,24 @@ with tab_trail:
 with tab_backtest:
     st.markdown('<div class="section-title">Backtest Engine · 15M Intraday · IDX</div>',unsafe_allow_html=True)
     bt_c1,bt_c2,bt_c3,bt_c4=st.columns(4)
-    bt_mode   =bt_c1.selectbox("Mode Backtest",["Scalping ⚡","Momentum 🚀","Reversal 🎯","Bagger 💎"],key="bt_mode")
-    bt_sc     =bt_c2.slider("Min Score Entry",0,6,4,key="bt_sc")
-    bt_fwd    =int(bt_c3.number_input("Hold (bars)",value=4,step=1,min_value=1,max_value=20))
-    bt_sl_mult=bt_c4.number_input("SL mult (x ATR)",value=0.8,step=0.1,min_value=0.1,max_value=3.0)
-    st.caption(f"Hold {bt_fwd} bars × 15 menit = ~{bt_fwd*15} menit per trade")
+    bt_mode=bt_c1.selectbox("Mode",["Scalping ⚡","Momentum 🚀","Reversal 🎯","Bagger 💎"],key="bt_mode")
+    bt_sc=bt_c2.slider("Min Score",0,6,4,key="bt_sc")
+    bt_fwd=int(bt_c3.number_input("Hold (bars)",value=4,step=1,min_value=1,max_value=20))
+    bt_sl_mult=bt_c4.number_input("SL mult (xATR)",value=0.8,step=0.1,min_value=0.1,max_value=3.0)
+    st.caption(f"Hold {bt_fwd} bars × 15 min = ~{bt_fwd*15} menit per trade")
     if st.button("🚀 Run Backtest",type="primary",key="bt_run"):
         data_dict=st.session_state.get("data_dict",{})
         if not data_dict:
-            st.warning("Jalankan Scanner dulu bro!")
+            st.warning("Run Scanner dulu bro!")
         else:
             bt_results=[]; bt_by_trend={"▲ UP":[],"▼ DOWN":[],"◆ SIDE":[]}
-            bt_by_session={"Pagi 09-11":[],"Siang 11-14":[],"Sore 14-16":[]}; bt_by_score={4:[],5:[],6:[]}
+            bt_by_session={"Pagi 09-11":[],"Siang 11-14":[],"Sore 14-16":[]}
+            bt_by_score={4:[],5:[],6:[]}
             bt_pb=st.progress(0); sample=list(data_dict.keys())[:80]
-            for bi,t_yf in enumerate(sample):
+            for bi,ticker in enumerate(sample):
                 bt_pb.progress((bi+1)/len(sample))
                 try:
-                    d=data_dict[t_yf].copy()
+                    d=data_dict[ticker].copy()
                     if len(d)<60: continue
                     d=apply_indicators(d)
                     for ii in range(50,len(d)-bt_fwd):
@@ -1927,7 +1822,7 @@ with tab_backtest:
                         bt_by_trend[tr].append(ret)
                         try:
                             hr=d.index[ii].hour
-                            if 9<=hr<11:   bt_by_session["Pagi 09-11"].append(ret)
+                            if 9<=hr<11:  bt_by_session["Pagi 09-11"].append(ret)
                             elif 11<=hr<14: bt_by_session["Siang 11-14"].append(ret)
                             elif 14<=hr<16: bt_by_session["Sore 14-16"].append(ret)
                         except: pass
@@ -1936,7 +1831,7 @@ with tab_backtest:
                 except: continue
             bt_pb.empty()
             if not bt_results:
-                st.warning("Tidak ada trades yang match. Turunkan Min Score.")
+                st.warning("Tidak ada trade yang match. Kurangi Min Score.")
             else:
                 arr=np.array(bt_results); wr=len(arr[arr>0])/len(arr)*100
                 avg=np.mean(arr); med=np.median(arr)
@@ -1956,7 +1851,7 @@ with tab_backtest:
                     <span class="bt-metric"><div class="bt-metric-val" style="color:#00ff88">{sum(1 for x in bt_results if x>0)}</div><div class="bt-metric-lbl">TP Hits</div></span>
                     <span class="bt-metric"><div class="bt-metric-val" style="color:#ff3d5a">{sum(1 for x in bt_results if x<0)}</div><div class="bt-metric-lbl">SL Hits</div></span>
                   </div>
-                </div>""", unsafe_allow_html=True)
+                </div>""",unsafe_allow_html=True)
                 tab_tr,tab_ses,tab_sc2=st.tabs(["📈 Per Trend","⏰ Per Sesi","🎯 Per Score"])
                 with tab_tr:
                     for tr_name,vals in bt_by_trend.items():
@@ -1979,32 +1874,33 @@ with tab_backtest:
                         st.markdown(f'<div style="margin-bottom:10px;"><div style="display:flex;justify-content:space-between;"><span style="font-family:Space Mono,monospace;font-size:12px;color:#c9d1d9;">Score {sc_lv} [{"█"*sc_lv+"░"*(6-sc_lv)}]</span><span style="font-family:Space Mono,monospace;font-size:11px;color:{col};">{wr_v:.1f}% WR · avg {avg_v:+.2f}% · {len(a)} trades</span></div><div style="height:8px;background:var(--border);border-radius:4px;overflow:hidden;margin-top:4px;"><div style="width:{int(wr_v)}%;height:100%;background:{col};border-radius:4px;"></div></div></div>',unsafe_allow_html=True)
 
 # ════════════════════════════════════════════════════
-#  FOOTER + AUTO-REFRESH
+#  FOOTER
 # ════════════════════════════════════════════════════
-_now_f = datetime.now(jakarta_tz).timestamp()
+_now_f=datetime.now(jakarta_tz).timestamp()
 if st.session_state.last_scan_time:
-    _rem2   = max(0, 300-(_now_f-st.session_state.last_scan_time))
-    mnt2    = int(_rem2//60); sec2=int(_rem2%60)
-    last_t2 = datetime.fromtimestamp(st.session_state.last_scan_time,jakarta_tz).strftime("%H:%M:%S")
-    last_mode_f = st.session_state.get("last_scan_mode","")
-    tf_f    = "📅 Daily" if last_mode_f=="Bagger 💎" else "⚡ 15M"
-    time_info = f"⏱️ Next: <span style='color:#ff7b00'>{mnt2:02d}:{sec2:02d}</span> · Last: <span style='color:#2dd4bf'>{last_t2} WIB</span> · {tf_f}"
+    _rem2=max(0,300-(_now_f-st.session_state.last_scan_time))
+    mnt2=int(_rem2//60); sec2=int(_rem2%60)
+    last_t2=datetime.fromtimestamp(st.session_state.last_scan_time,jakarta_tz).strftime("%H:%M:%S")
+    time_info=f"⏱️ Next auto-scan: <span style='color:#ff7b00'>{mnt2:02d}:{sec2:02d}</span> · Last: <span style='color:#2dd4bf'>{last_t2} WIB</span>"
 else:
-    _rem2 = 300
-    time_info = "⏱️ Klik Scan untuk mulai"
+    time_info="⏱️ Klik Scan untuk mulai"
 
 st.markdown(f"""
 <div style="margin-top:28px;padding-top:14px;border-top:1px solid #1c2533;
      display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;">
   <div style="font-family:Space Mono,monospace;font-size:10px;color:#4a5568;">
-    🔥 Theta Turbo v5.2 · Wyckoff Bagger Daily · Auto Regime · IDX 900+
+    🔥 Theta Turbo v5.2 · IDX · 15M + Daily Wyckoff · yFinance Humanized
   </div>
   <div style="font-family:Space Mono,monospace;font-size:10px;color:#4a5568;">{time_info}</div>
-</div>""", unsafe_allow_html=True)
+</div>
+<div style="font-family:Space Mono,monospace;font-size:9px;color:#2d3748;text-align:center;margin-top:8px;">
+  ⚠️ BUKAN saran investasi · Untuk tujuan edukasi · DYOR selalu
+</div>""",unsafe_allow_html=True)
 
-# Auto-rerun — simple & clean, no JS conflict
+# ════════════════════════════════════════════════════
+#  AUTO-REFRESH
+# ════════════════════════════════════════════════════
 if st.session_state.last_scan_time:
-    _elapsed_f = _now_f - st.session_state.last_scan_time
-    if _elapsed_f >= 295:
-        time.sleep(5)
-        st.rerun()
+    _now_f2=datetime.now(jakarta_tz).timestamp()
+    if _now_f2-st.session_state.last_scan_time>=295:
+        time.sleep(5); st.rerun()
