@@ -1177,6 +1177,23 @@ rcfg=get_regime_config(regime); rcolor=rcfg["color"]
 chg_col="#00ff88" if spx_chg>=0 else "#ff3d5a"; chg_sym="▲" if spx_chg>=0 else "▼"
 now_et=datetime.now(et_tz); is_open=True  # crypto 24/7
 
+# Fetch USDIDR for Indonesian forex traders — quick Rupiah strength indicator
+@st.cache_data(ttl=300, show_spinner=False)
+def _get_usdidr():
+    try:
+        df = _fetch_yf_ticker("USDIDR=X", "5d", "1d")
+        if df is None or len(df) < 2: return None, 0.0
+        close = df["Close"].dropna()
+        if len(close) < 2: return None, 0.0
+        rate = float(close.iloc[-1])
+        chg = float(((close.iloc[-1] - close.iloc[-2]) / close.iloc[-2]) * 100)
+        return rate, chg
+    except: return None, 0.0
+
+usdidr_rate, usdidr_chg = _get_usdidr()
+idr_chg_col = "#00ff88" if usdidr_chg <= 0 else "#ff3d5a"  # IDR menguat (USDIDR turun) = hijau bagus
+idr_chg_sym = "▼" if usdidr_chg < 0 else "▲" if usdidr_chg > 0 else "•"
+
 st.markdown(f"""<div class="tt-header">
   <div><div class="tt-logo">⚡ MESIN PRESISI FOREX 💱</div>
   <div class="tt-sub">TT 15M × Forex Quant Daily (151 Strategies) · v1.0 · Zero Rate Limit ✅</div></div>
@@ -1185,7 +1202,24 @@ st.markdown(f"""<div class="tt-header">
   </div>
 </div>""", unsafe_allow_html=True)
 
-st.markdown(f"""<div style="background:rgba(0,0,0,.4);border:1px solid {rcolor}44;border-radius:8px;padding:12px 16px;margin-bottom:14px;border-left:4px solid {rcolor};">
+# Regime banner + IDR widget side-by-side
+idr_widget = ""
+if usdidr_rate:
+    idr_status = "IDR MENGUAT 💪" if usdidr_chg < -0.3 else "IDR MELEMAH ⚠️" if usdidr_chg > 0.3 else "IDR STABIL"
+    idr_widget = f"""
+    <div style="background:linear-gradient(135deg,#1a0d2e,#0d1421);border:1px solid #4a1c7a;border-radius:8px;padding:12px 16px;margin-bottom:14px;border-left:4px solid #bf5fff;">
+      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
+        <div><div style="font-family:Space Mono,monospace;font-size:12px;font-weight:700;color:#bf5fff;letter-spacing:1px;">🇮🇩 USD/IDR LIVE · {idr_status}</div>
+             <div style="font-family:Space Mono,monospace;font-size:10px;color:#4a5568;margin-top:3px;">Konversi: 1 USD = Rp {usdidr_rate:,.0f} · 1 lot EURUSD ≈ Rp {usdidr_rate*100000:,.0f} margin</div></div>
+        <div style="text-align:right;font-family:Space Mono,monospace;">
+          <div style="font-size:18px;font-weight:700;color:#bf5fff;">Rp {usdidr_rate:,.0f} <span style="font-size:11px;color:{idr_chg_col}">{idr_chg_sym}{abs(usdidr_chg):.2f}%</span></div>
+          <div style="font-size:9px;color:#4a5568;">1 EUR ≈ Rp {usdidr_rate*1.085:,.0f} · 1 JPY ≈ Rp {usdidr_rate/150:,.1f} · 1 SGD ≈ Rp {usdidr_rate/1.35:,.0f}</div>
+        </div>
+      </div>
+    </div>
+    """
+
+st.markdown(idr_widget + f"""<div style="background:rgba(0,0,0,.4);border:1px solid {rcolor}44;border-radius:8px;padding:12px 16px;margin-bottom:14px;border-left:4px solid {rcolor};">
   <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
     <div><div style="font-family:Space Mono,monospace;font-size:12px;font-weight:700;color:{rcolor};letter-spacing:1px;">{rcfg["label"]}</div>
          <div style="font-family:Space Mono,monospace;font-size:10px;color:#4a5568;margin-top:3px;">{rcfg["desc"]}</div></div>
@@ -1836,7 +1870,7 @@ with tab_watchlist:
     st.markdown('<div style="font-family:Space Mono,monospace;font-size:10px;color:#4a5568;margin-bottom:12px;padding:10px 14px;background:#0d1117;border-radius:6px;border-left:3px solid #ff7b00;">Analisa mendalam per stocks. Input ticker IDX (tanpa .JK).</div>',unsafe_allow_html=True)
     wc1,wc2,wc3=st.columns([3,1,1])
     with wc1:
-        wl_input=st.text_area("Ticker",placeholder="Contoh:\nBBCA\nARCI, ASSA, GOTO",height=120,label_visibility="collapsed",key="wl_input")
+        wl_input=st.text_area("Ticker",placeholder="Contoh:\nEURUSD\nGBPUSD, USDJPY, USDIDR\nXAUUSD, AUDJPY",height=120,label_visibility="collapsed",key="wl_input")
     with wc2:
         wl_mode=st.radio("Mode",["Scalping ⚡","Momentum 🚀","Reversal 🎯","Bagger 💎"],key="wl_mode")
         st.caption(f"Regime suggest: {rcfg['mode']}")
@@ -1846,7 +1880,18 @@ with tab_watchlist:
         wl_run=st.button("🔍 Analisa",use_container_width=True,key="wl_run")
         wl_tele=st.button("📡 Kirim Telegram",use_container_width=True,key="wl_tele")
     if wl_run and wl_input.strip():
-        raw_wl=list(dict.fromkeys([t.strip().upper() for ln in wl_input.split("\n") for t in ln.split(",") if t.strip()]))
+        # Parse + auto-append =X for forex codes (e.g. user types "EURUSD" → "EURUSD=X")
+        def _norm_fx(t):
+            t = t.strip().upper()
+            if not t: return ""
+            # Already has yFinance suffix
+            if any(s in t for s in ["=X","=F","-USD",".JK","^"]): return t
+            # 6-letter alpha = forex pair (EURUSD, USDJPY, USDIDR, XAUUSD)
+            if len(t) == 6 and t.isalpha():
+                return f"{t}=X"
+            return t  # ETF / futures direct (GLD, GC, etc)
+        raw_wl=list(dict.fromkeys([_norm_fx(t) for ln in wl_input.split("\n") for t in ln.split(",") if t.strip()]))
+        raw_wl=[t for t in raw_wl if t]  # filter empty
         if raw_wl:
             wl_res=[]; _pb_wl=st.progress(0)
             for i,t in enumerate(raw_wl):
