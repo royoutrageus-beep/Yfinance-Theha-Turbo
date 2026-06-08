@@ -594,9 +594,20 @@ stock_map={s:s for s in raw_stocks}  # US: identity map
 @st.cache_data(ttl=300)
 def get_market_regime():
     try:
-        df = _fetch_yf_ticker("DX=F", "60d", "1d")  # ← no yf.download!
+        # Try DX=F first (Dollar Index futures - primary)
+        df = _fetch_yf_ticker("DX=F", "60d", "1d")
         if df is None or len(df) < 10:
-            return ("UNKNOWN", 0, 0, 0, "Data DXY kurang", 0.0)
+            # Fallback 1: UUP ETF (PowerShares DB US Dollar Bullish — tracks DXY closely)
+            df = _fetch_yf_ticker("UUP", "60d", "1d")
+            if df is None or len(df) < 10:
+                # Fallback 2: EURUSD inverse as DXY proxy (EURUSD is ~57% of DXY weight)
+                df_eur = _fetch_yf_ticker("EURUSD=X", "60d", "1d")
+                if df_eur is not None and len(df_eur) >= 10:
+                    # Invert: high EURUSD = low DXY, so use 1/EURUSD as proxy
+                    df = df_eur.copy()
+                    df["Close"] = 1.0 / df_eur["Close"]
+                else:
+                    return ("UNKNOWN", 0, 0, 0, "DXY/UUP/EURUSD semua fail — coba refresh", 0.0)
         close = df["Close"].dropna()
         if len(close) < 10: return ("UNKNOWN", 0, 0, 0, "Data close kurang", 0.0)
         ema20 = float(close.ewm(span=20, adjust=False).mean().iloc[-1])
@@ -1242,18 +1253,18 @@ with tab_scanner:
     if do_diagnosa:
         with st.expander("🔧 DIAGNOSTIK yFinance", expanded=True):
             st.code(f"yfinance: {yf.__version__}")
-            for _tk in ["DX=F","ETH-USD","SOL-USD"]:
+            for _tk in ["DX=F","EURUSD=X","GBPUSD=X","USDIDR=X"]:
                 _r = _fetch_yf_ticker(_tk, "5d", "1d")
                 if _r is not None:
-                    st.success(f"✅ {_tk} → {len(_r)} rows, Close[-1]={float(_r['Close'].iloc[-1]):,.0f}")
+                    st.success(f"✅ {_tk} → {len(_r)} rows, Close[-1]={float(_r['Close'].iloc[-1]):,.4f}")
                 else:
                     st.error(f"❌ {_tk} → GAGAL")
             # test 15m
-            _r15 = _fetch_yf_ticker("DX=F","5d","15m")
+            _r15 = _fetch_yf_ticker("EURUSD=X","5d","15m")
             if _r15 is not None:
-                st.success(f"✅ BBCA 15m → {len(_r15)} rows ✓")
+                st.success(f"✅ EURUSD=X 15m → {len(_r15)} rows ✓ (intraday work)")
             else:
-                st.error("❌ BBCA 15m → GAGAL — coba ganti requirements.txt: yfinance==0.2.61")
+                st.error("❌ EURUSD=X 15m → GAGAL — coba ganti requirements.txt: yfinance==0.2.61")
     _now_check=now_et.timestamp(); auto_trigger=False
     if st.session_state.last_scan_time and not do_scan_btn:
         if _now_check-st.session_state.last_scan_time>=300 and st.session_state.scan_results:
@@ -1388,28 +1399,40 @@ with tab_scanner:
                     close=_sff(r.get("Close",0)); vol=_sff(r.get("Volume",0))
                     if close<=0: skip_reasons["price0"]+=1; continue  # skip jika harga invalid
                     ticker_raw=ticker_yf.upper()
-                    # FIX: gak boleh pakai `or` untuk DataFrame (ambiguous truth value)
-                    df_d = daily_dict.get(ticker_yf)
-                    if df_d is None: df_d = daily_dict.get(ticker_raw)
-                    if df_d is not None and len(df_d)>=2:
-                        c1=float(df_d.iloc[-1]["Close"]); c0=float(df_d.iloc[-2]["Close"])
-                        gain_pct=(c1-c0)/max(c0,1)*100
-                        d_vol=float(df_d.iloc[-1]["Volume"])
-                        if d_vol > 0:
-                            turnover=c1*d_vol  # daily volume normal
-                        else:
-                            # daily vol=0 (weekend/sebelum open) → 15m vol sum fallback
-                            turnover=close*float(df["Volume"].fillna(0).sum())
+
+                    # FOREX BYPASS: yFinance returns Volume=0 untuk semua pair =X
+                    # (forex desentralisasi, gak ada exchange tracking volume).
+                    # Forex inherently sangat liquid → set synthetic turnover & rvol.
+                    is_forex = "=X" in ticker_raw
+                    if is_forex:
+                        turnover = 1_000_000_000.0  # 1B synthetic (always passes)
+                        rvol = 1.5                   # neutral RVOL
+                        gain_pct = float(r.get("ROC3", 0)) * 100
                     else:
-                        try:
-                            # Fallback: sum semua 15m volume (aman tanpa timezone issue)
-                            turnover=close*float(df["Volume"].fillna(0).sum())
-                            gain_pct=float(r.get("ROC3",0))*100
-                        except:
-                            turnover=close*max(vol,0); gain_pct=float(r.get("ROC3",0))*100
-                    rvol_raw=float(r["RVOL"]) if not np.isnan(float(r["RVOL"])) else 1.0
-                    rvol=rvol_raw
-                    if turnover<min_turn or rvol<vol_thresh: skip_reasons["turnover"]+=1; continue
+                        # Non-forex logic (stocks/crypto with real volume)
+                        df_d = daily_dict.get(ticker_yf)
+                        if df_d is None: df_d = daily_dict.get(ticker_raw)
+                        if df_d is not None and len(df_d) >= 2:
+                            c1 = float(df_d.iloc[-1]["Close"]); c0 = float(df_d.iloc[-2]["Close"])
+                            gain_pct = (c1 - c0) / max(c0, 1) * 100
+                            d_vol = float(df_d.iloc[-1]["Volume"])
+                            if d_vol > 0:
+                                turnover = c1 * d_vol  # daily volume normal
+                            else:
+                                # weekend/sebelum open → 15m vol sum fallback
+                                turnover = close * float(df["Volume"].fillna(0).sum())
+                        else:
+                            try:
+                                turnover = close * float(df["Volume"].fillna(0).sum())
+                                gain_pct = float(r.get("ROC3", 0)) * 100
+                            except:
+                                turnover = close * max(vol, 0)
+                                gain_pct = float(r.get("ROC3", 0)) * 100
+                        rvol_raw = float(r["RVOL"]) if not np.isnan(float(r["RVOL"])) else 1.0
+                        rvol = rvol_raw
+
+                    if turnover < min_turn or rvol < vol_thresh:
+                        skip_reasons["turnover"] += 1; continue
                     if scan_mode=="Scalping ⚡":   sc,reasons,_=score_scalping(r,p,p2)
                     elif scan_mode=="Momentum 🚀": sc,reasons,_=score_momentum(r,p,p2)
                     elif scan_mode=="Bagger 💎":   sc,reasons,_=score_bagger(r,p,p2,df)
