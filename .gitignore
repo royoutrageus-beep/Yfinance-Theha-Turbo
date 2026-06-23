@@ -1,6 +1,0 @@
-# RAHASIA — jangan pernah commit kredensial
-.streamlit/secrets.toml
-gemini_key.txt
-flow_data/
-*.pyc
-__pycache__/
