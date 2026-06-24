@@ -1125,9 +1125,26 @@ def render_infographic_pil(ticker, tf, result, card, summary, buy_df, sell_df,
                             fill=fill, outline=border, width=bw)
 
     def clean_emoji(s):
-        """Buang emoji (DejaVu gak render emoji) — sisakan teks bersih."""
+        """Buang emoji + normalisasi karakter spesial yang DejaVu gak render bersih."""
         import re
-        return re.sub(r'[\U0001F000-\U0001FAFF\u2600-\u27BF\uFE0F]', '', s).strip()
+        if not s:
+            return ""
+        # normalisasi karakter mirip yang sering jadi kotak
+        repl = {
+            "—": "-", "–": "-", "−": "-",   # berbagai dash/minus → hyphen biasa
+            "'": "'", "'": "'", """: '"', """: '"',  # smart quotes
+            "…": "...", "•": "-", "·": "·",
+            "→": "->", "←": "<-", "↑": "^", "↓": "v",
+            "≈": "~", "≥": ">=", "≤": "<=",
+            "\u00a0": " ",  # non-breaking space
+        }
+        for a, b in repl.items():
+            s = s.replace(a, b)
+        # buang emoji & simbol di luar BMP umum yang DejaVu gak punya
+        s = re.sub(r'[\U0001F000-\U0001FAFF\U00002600-\U000027BF'
+                   r'\U0001F900-\U0001F9FF\U00002190-\U000021FF'
+                   r'\uFE0F\u2B00-\u2BFF\u2300-\u23FF]', '', s)
+        return s.strip()
 
     # ── HEADER ──
     d.text((M, y), "FLOW READER", font=f_brand, fill=GOLD)
@@ -1146,7 +1163,7 @@ def render_infographic_pil(ticker, tf, result, card, summary, buy_df, sell_df,
         card["bg"] if card["bg"].startswith("#") else "#11161f")
     panel(M, y, W - 2 * M, card_h, fill=cbg, border=ccol, bw=2, radius=14)
     d.text((M + 22, y + 18), clean_emoji(card["label"]), font=f_card, fill=ccol)
-    for i, ln in enumerate(_wrap_text(d, card["desc"], f_cardd, W - 2 * M - 44)[:2]):
+    for i, ln in enumerate(_wrap_text(d, clean_emoji(card["desc"]), f_cardd, W - 2 * M - 44)[:2]):
         d.text((M + 22, y + 56 + i * 20), ln, font=f_cardd, fill=_hex("#cbd5e1"))
     y += card_h + 20
 
@@ -1225,7 +1242,7 @@ def render_infographic_pil(ticker, tf, result, card, summary, buy_df, sell_df,
     sy = y_top + 44
     for label, text, color in summary:
         col = _hex(color)
-        clean = text.replace("**", "").replace("*", "")
+        clean = clean_emoji(text.replace("**", "").replace("*", ""))
         d.rectangle([right_x + 14, sy, right_x + 17, sy + 18], fill=col)
         d.text((right_x + 26, sy), clean_emoji(label), font=_load_font(12, bold=True), fill=col)
         wrapped = _wrap_text(d, clean, f_body, col_w - 50)
@@ -1262,10 +1279,10 @@ def render_infographic_pil(ticker, tf, result, card, summary, buy_df, sell_df,
 
     # ── NARASI AI ──
     if narrative and not narrative.startswith("⚠️"):
-        clean = narrative.replace("##", "").replace("**", "").replace("*", "").replace("`", "")
+        clean = clean_emoji(narrative.replace("##", "").replace("**", "").replace("*", "").replace("`", ""))
         lines = []
         for para in clean.split("\n"):
-            para = para.strip()
+            para = clean_emoji(para.strip())
             if not para:
                 lines.append("")
                 continue
@@ -1938,6 +1955,9 @@ with _main:
             fmt_choice = st.radio(
                 "Format kiriman", ["🖼️ Infografis PNG", "📄 Infografis PDF", "📝 Teks biasa"],
                 horizontal=True, key="tg_fmt")
+            st.caption("💡 PNG & PDF dikirim sebagai **file/document** (HD, gak diremukin "
+                       "Telegram). Kalau dikirim sebagai foto biasa, Telegram auto-kompres "
+                       "jadi pecah — makanya dikirim sebagai file.")
 
             # preview infografis (PNG) di app sebelum kirim — Pillow, selalu jalan
             if fmt_choice.startswith("🖼️") or fmt_choice.startswith("📄"):
@@ -1981,8 +2001,10 @@ with _main:
                                     ok, info = send_telegram_document(
                                         pdf, f"{ticker}_flow.pdf", caption=cap, as_photo=False)
                             else:
+                                # PNG dikirim sebagai DOCUMENT (bukan photo) biar Telegram
+                                # GAK kompres → tetap HD & tajam. Photo selalu diremukin Telegram.
                                 ok, info = send_telegram_document(
-                                    png, f"{ticker}_flow.png", caption=cap, as_photo=True)
+                                    png, f"{ticker}_flow.png", caption=cap, as_photo=False)
                 if ok:
                     st.success(f"✅ {info}")
                 else:
