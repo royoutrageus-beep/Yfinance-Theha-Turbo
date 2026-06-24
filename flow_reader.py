@@ -986,7 +986,7 @@ def _metrics_html(result):
     defs = [("Konsentrasi", "Konsentrasi Buyer", "{:.0%}"),
             ("Avg vs Hrg", "Avg Buyer vs Harga", "{:,.0f}"),
             ("Big/Retail", "Big vs Retail", "{:+,.0f}"),
-            ("Running", "Running Pressure", "{:+.0%}")]
+            ("Orderbook", "Running Pressure", "{:+.0%}")]
     out = ""
     for short, key, fmt in defs:
         raw, pts = result["breakdown"].get(key, (0, 0))
@@ -1055,44 +1055,69 @@ def _wrap_text(draw, text, font, max_w):
 
 
 def render_infographic_pil(ticker, tf, result, card, summary, buy_df, sell_df,
-                           last_price, narrative):
+                           last_price, narrative, scale=2):
     """
     Render infografis pakai Pillow MURNI (gak butuh wkhtml/Chrome/kaleido).
-    Return PNG bytes. Selalu jalan asal Pillow keinstall.
+    Teknik: render di koordinat logical 1x, lalu canvas di-supersample S kali
+    via ImageDraw yang otomatis scale semua koordinat & font → output tajam HD.
+    Return PNG bytes.
     """
     from PIL import Image, ImageDraw
     import io as _io
     import math
 
-    W = 1080
+    S = scale  # 2 = HD (~2160px), 3 = 4K-ish
+
     BG = _hex("#0a0e14")
-    PANEL = _hex("#0e141c")
-    BORDER = _hex("#1e2530")
-    GOLD = _hex("#e8b339")
-    MUTE = _hex("#8b949e")
-    TXT = _hex("#e6edf3")
+    PANEL = _hex("#11171f")        # lebih terang → kontras lebih baik
+    BORDER = _hex("#2a3441")       # border lebih jelas
+    GOLD = _hex("#f0c040")         # gold lebih terang
+    MUTE = _hex("#aeb9c4")         # mute lebih kebaca
+    TXT = _hex("#f2f5f8")          # teks utama lebih putih
     ccol = _hex(card["color"])
 
-    # fonts
-    f_brand = _load_font(18, bold=True)
-    f_tk = _load_font(52, bold=True)
-    f_meta = _load_font(18)
-    f_price = _load_font(40, bold=True, mono=True)
-    f_card = _load_font(34, bold=True, mono=True)
-    f_cardd = _load_font(17)
-    f_h = _load_font(18, bold=True)
-    f_score = _load_font(72, bold=True, mono=True)
-    f_metric = _load_font(22, bold=True, mono=True)
-    f_small = _load_font(13)
-    f_body = _load_font(15)
-    f_bodyb = _load_font(15, bold=True)
-    f_mono = _load_font(15, mono=True)
+    # ── Draw wrapper: semua koordinat & ukuran otomatis dikali S ──
+    class SDraw:
+        """Proxy ImageDraw yang scale semua koordinat numerik dengan S."""
+        def __init__(self, draw, s):
+            self._d = draw; self._s = s
+        def _sc(self, v):
+            if isinstance(v, (int, float)): return v * self._s
+            if isinstance(v, (list, tuple)):
+                return type(v)(self._sc(x) for x in v)
+            return v
+        def text(self, xy, *a, **k):
+            self._d.text(self._sc(xy), *a, **k)
+        def line(self, xy, **k):
+            if "width" in k: k["width"] = int(k["width"] * self._s) or 1
+            self._d.line(self._sc(xy), **k)
+        def rectangle(self, xy, **k):
+            self._d.rectangle(self._sc(xy), **k)
+        def rounded_rectangle(self, xy, radius=0, **k):
+            if "width" in k: k["width"] = int(k["width"] * self._s) or 1
+            self._d.rounded_rectangle(self._sc(xy), radius=self._sc(radius), **k)
+        def ellipse(self, xy, **k):
+            self._d.ellipse(self._sc(xy), **k)
+        def pieslice(self, xy, start, end, **k):
+            self._d.pieslice(self._sc(xy), start, end, **k)
+        def textlength(self, text, font=None):
+            # balikin dalam koordinat LOGICAL (font di-scale, jadi bagi S)
+            return self._d.textlength(text, font=font) / self._s
 
-    # estimasi tinggi dulu (biar muat semua) — pakai canvas tinggi, crop nanti
-    H = 5200  # canvas tinggi (di-crop ke konten aktual nanti) — muat narasi panjang
-    img = Image.new("RGB", (W, H), BG)
-    d = ImageDraw.Draw(img)
-    M = 32  # margin
+    def F(sz, **kw):  # font di-scale ke resolusi nyata
+        return _load_font(int(sz * S), **kw)
+
+    f_brand = F(18, bold=True); f_tk = F(52, bold=True); f_meta = F(18)
+    f_price = F(40, bold=True, mono=True); f_card = F(34, bold=True, mono=True)
+    f_cardd = F(17); f_h = F(18, bold=True); f_score = F(72, bold=True, mono=True)
+    f_metric = F(22, bold=True, mono=True); f_small = F(13); f_body = F(15)
+    f_bodyb = F(15, bold=True); f_mono = F(15, mono=True)
+
+    W = 1080  # koordinat LOGICAL (real canvas = W*S)
+    H = 5200
+    img = Image.new("RGB", (W * S, H * S), BG)
+    d = SDraw(ImageDraw.Draw(img), S)
+    M = 32  # margin (logical)
     y = M
 
     def panel(x, yy, w, h, fill=PANEL, border=BORDER, bw=1, radius=12):
@@ -1143,7 +1168,7 @@ def render_infographic_pil(ticker, tf, result, card, summary, buy_df, sell_df,
     mdefs = [("KONSEN", "Konsentrasi Buyer", "{:.0%}"),
              ("AVG/HRG", "Avg Buyer vs Harga", "{:,.0f}"),
              ("BIG/RTL", "Big vs Retail", "{:+,.0f}"),
-             ("RUNNING", "Running Pressure", "{:+.0%}")]
+             ("ORDERBOOK", "Running Pressure", "{:+.0%}")]
     mw = (col_w - 20 - 3 * 8) // 4
     mx = left_x + 10
     my = y + 150
@@ -1261,8 +1286,9 @@ def render_infographic_pil(ticker, tf, result, card, summary, buy_df, sell_df,
            font=f_small, fill=MUTE, anchor="ma")
     y += 30
 
-    # crop ke tinggi konten + simpan
-    img = img.crop((0, 0, W, min(y, H)))
+    # crop ke tinggi konten + simpan (koordinat real = logical * S)
+    real_h = min(int(y * S), H * S)
+    img = img.crop((0, 0, W * S, real_h))
     buf = _io.BytesIO()
     img.save(buf, "PNG")
     return buf.getvalue()
@@ -1485,16 +1511,24 @@ with st.sidebar:
     tf = st.selectbox("Timeframe", ["Pendek (intraday/daily)", "Sedang (mingguan)", "Panjang (bulanan)"])
 
     st.markdown("---")
-    st.markdown("### 🏦 BANDAR (Big vs Retail)")
-    big_net = st.number_input("Big Money Net (lot, +/-)", value=0.0, step=100.0,
-                              help="Net big broker. Positif = akumulasi.")
-    retail_net = st.number_input("Retail Net (lot, +/-)", value=0.0, step=100.0,
-                                 help="Net retail. Positif = ritel beli (sering kontrarian).")
+    st.markdown("### 🏦 BANDAR (opsional)")
+    st.caption("Skip aja kalau males — dari broker summary udah ketauan bandarnya. "
+               "Isi cuma kalau lo punya data Bandar Detector (Stockbit) buat nambah presisi.")
+    big_net = st.number_input("Big Money Net (lot, +/−)", value=0.0, step=100.0,
+                              help="Dari Bandar Detector Stockbit: Net Volume sisi 'Big Acc'. "
+                                   "Positif = big player akumulasi. Kosongin = skip.")
+    retail_net = st.number_input("Retail Net (lot, +/−)", value=0.0, step=100.0,
+                                 help="Net volume ritel. Positif = ritel beli (sering kontrarian "
+                                      "vs bandar). Kosongin = skip.")
 
     st.markdown("---")
-    st.markdown("### 🏃 RUNNING TRADE")
-    lifting = st.number_input("Lifting Offer (agresif beli)", min_value=0.0, value=0.0, step=10.0)
-    hitting = st.number_input("Hitting Bid (agresif jual)", min_value=0.0, value=0.0, step=10.0)
+    st.markdown("### 📊 ORDERBOOK (opsional)")
+    st.caption("Tekanan agresif dari orderbook/running. Lifting = beli ngejar offer, "
+               "Hitting = jual nabrak bid. Skip kalau gak ada datanya.")
+    lifting = st.number_input("Lifting Offer (lot, agresif beli)", min_value=0.0, value=0.0, step=10.0,
+                              help="Total lot yang lifting offer (beli agresif angkat harga).")
+    hitting = st.number_input("Hitting Bid (lot, agresif jual)", min_value=0.0, value=0.0, step=10.0,
+                              help="Total lot yang hitting bid (jual agresif tekan harga).")
 
     st.markdown("---")
     notes = st.text_area("📝 Catatan / konteks", placeholder="cth: lagi di support kuat, abis breakout, dll")
@@ -1955,4 +1989,3 @@ with _main:
                     st.error(f"❌ Gagal: {info}")
 
         st.caption("⚠️ Tool bantu baca flow, BUKAN sinyal beli/jual. Validasi sendiri + manajemen risiko.")
-
