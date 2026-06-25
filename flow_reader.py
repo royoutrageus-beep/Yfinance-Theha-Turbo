@@ -518,6 +518,65 @@ def analyze_laba(laba_list):
 
 
 # ════════════════════════════════════════════════════════════════════
+# PASAR NEGOSIASI (TN) — analisa perpindahan barang "di belakang layar"
+# ════════════════════════════════════════════════════════════════════
+def analyze_nego(nego_df, last_price):
+    """
+    Analisa transaksi Pasar Nego (TN). Beda dari reguler:
+    di TN, broker sering jadi PERANTARA crossing (buy=sell), jadi yang dibaca
+    bukan net flow tapi VOLUME perpindahan + harga (avg) vs harga pasar.
+    Return dict: total_val, broker terbesar, avg_tn, diskon/premium, dll.
+    """
+    out = {
+        "total_val": 0.0, "n_brokers": 0, "top_brokers": [],
+        "avg_tn": None, "vs_market_pct": None, "verdict": "",
+        "is_jumbo": False, "biggest": None,
+    }
+    if nego_df is None or len(nego_df) == 0:
+        return out
+
+    total_val = nego_df["val"].sum()
+    out["total_val"] = float(total_val)
+    out["n_brokers"] = len(nego_df)
+    if total_val <= 0:
+        return out
+
+    # broker dengan value crossing terbesar (perantara perpindahan)
+    top = nego_df.nlargest(min(5, len(nego_df)), "val")
+    out["top_brokers"] = [(r["broker"], float(r["val"]), float(r.get("avg", 0)))
+                          for _, r in top.iterrows()]
+    big = top.iloc[0]
+    out["biggest"] = (big["broker"], float(big["val"]), float(big.get("avg", 0)))
+
+    # weighted avg price TN (di harga berapa barang pindah)
+    if "avg" in nego_df.columns and (nego_df["avg"] > 0).any():
+        valid = nego_df[nego_df["avg"] > 0]
+        if valid["val"].sum() > 0:
+            avg_tn = (valid["avg"] * valid["val"]).sum() / valid["val"].sum()
+            out["avg_tn"] = round(float(avg_tn), 2)
+            if last_price > 0:
+                vs = (avg_tn - last_price) / last_price * 100
+                out["vs_market_pct"] = round(vs, 2)
+
+    # jumbo? (perpindahan signifikan — threshold kasar > 10 miliar)
+    out["is_jumbo"] = total_val >= 10e9
+
+    # verdict ringkas
+    vs = out["vs_market_pct"]
+    if vs is not None:
+        if vs < -2:
+            out["verdict"] = ("Barang pindah di DISKON (di bawah harga pasar) — "
+                              "indikasi akumulasi diam-diam / barang diserap tangan kuat di murah")
+        elif vs > 2:
+            out["verdict"] = ("Barang pindah di PREMIUM (di atas harga pasar) — "
+                              "ada yang rela bayar mahal, bisa jadi strategic buyer / korporasi")
+        else:
+            out["verdict"] = ("Barang pindah dekat harga pasar — crossing teknis biasa, "
+                              "perpindahan portofolio antar pihak")
+    return out
+
+
+# ════════════════════════════════════════════════════════════════════
 # (lanjut scoring di bawah)
 # ════════════════════════════════════════════════════════════════════
 def compute_flow_score(buy_df, sell_df, last_price, running, bandar):
@@ -1709,7 +1768,7 @@ def _enrich_broker_data(buy_df, sell_df, last_price):
     return "\n".join(lines)
 
 
-def generate_ai_narrative(ticker, tf, result, buy_df, sell_df, last_price, bandar, running, notes, smart=None, laba=None):
+def generate_ai_narrative(ticker, tf, result, buy_df, sell_df, last_price, bandar, running, notes, smart=None, laba=None, nego=None):
     broker_detail = _enrich_broker_data(buy_df, sell_df, last_price)
     tot_buy = buy_df["val"].sum() if buy_df is not None else 0
     tot_sell = sell_df["val"].sum() if sell_df is not None else 0
@@ -1762,6 +1821,21 @@ Pakai info ini buat validasi silang dengan data flow — apakah pergerakan banda
 KONSISTEN atau DIVERGEN dengan kabar ini.)
 """
 
+    # ── blok pasar nego (TN) — perpindahan barang belakang layar ──
+    nego_block = ""
+    if nego and nego.get("total_val", 0) > 0:
+        nb_brokers = ", ".join(f"{b[0]} ({fmt_value(b[1])})" for b in nego.get("top_brokers", [])[:3])
+        vs = nego.get("vs_market_pct")
+        vs_str = f"{vs:+.1f}% vs harga pasar" if vs is not None else "n/a"
+        nego_block = f"""
+🔄 PASAR NEGO (TN) — transaksi 'di belakang layar' (BUKAN pasar reguler):
+- Total perpindahan barang: {fmt_value(nego['total_val'])} {'(JUMBO!)' if nego.get('is_jumbo') else ''}
+- Avg harga TN: {nego.get('avg_tn', 'n/a')} ({vs_str})
+- Broker perantara crossing terbesar: {nb_brokers}
+- Interpretasi: {nego.get('verdict', '-')}
+CATATAN: di pasar nego, broker sering jadi PERANTARA (buy=sell), jadi baca VOLUME perpindahan + harga-nya, BUKAN net flow. Kalau di reguler keliatan distribusi TAPI di TN ada perpindahan jumbo di diskon → bisa jadi smart money nampung diam-diam. TAPI hati-hati: TN kadang cuma crossing teknis (pindah portofolio, settlement) yang gak ada makna directional.
+"""
+
     prompt = f"""Lo analis flow saham IDX (Indonesia) SENIOR, spesialis metode Wyckoff + bandarmologi (baca pergerakan bandar lewat broker summary). Gaya lo tajam, jujur, gak basa-basi, gak promosi. Pakai Bahasa Indonesia santai gaya 'bro' tapi tetap berbobot.
 
 ═══════════════════════════════
@@ -1780,7 +1854,7 @@ AGREGAT:
 - Net flow: {('+' if net>=0 else '')+fmt_value(net)} ({'beli unggul' if net>0 else 'jual unggul' if net<0 else 'imbang'})
 - Big money net (proxy): {fmt_value(bandar.get('big_net', 0))} | Retail net (proxy): {fmt_value(bandar.get('retail_net', 0))}
 - Running/orderbook: lifting {running.get('lifting')} vs hitting {running.get('hitting')}
-{smart_block}{laba_block}{notes_block}
+{smart_block}{laba_block}{nego_block}{notes_block}
 ═══════════════════════════════
 METODOLOGI WAJIB (gaya bandarmologi forensik / smart money):
 1. ANTI-NEWS DIVERGENCE: WAJIB pertimbangkan CATATAN/KONTEKS TRADER di atas (berita, rumor, kabar burung, sentimen). Kalau ada good news/pom-pom TAPI Top 3 broker net sell → tandai "JEBAKAN EXIT BANDAR". Kalau ada bad news TAPI bandar malah akumulasi → bisa jadi "buy the rumor" atau bandar tau kabar itu overblown. Kalau catatan trader nyebut rumor/aksi korporasi (right issue, akuisisi, dll), bahas dampaknya ke tesis. Jangan ketipu narasi, tapi JANGAN abaikan konteks yang dikasih trader.
@@ -2087,30 +2161,54 @@ with _main:
                     st.session_state["sell_table"] = ps
                     st.rerun()
 
-    # ── tabel input ──
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown("**🟢 NET BUYER**")
-        buy_init = st.session_state.get("buy_table", EMPTY_TABLE.copy())
-        buy_edit = st.data_editor(buy_init, num_rows="dynamic", use_container_width=True,
-                                  column_config=COL_CONFIG, hide_index=True, key="ed_buy")
-    with c2:
-        st.markdown("**🔴 NET SELLER**")
-        sell_init = st.session_state.get("sell_table", EMPTY_TABLE.copy())
-        sell_edit = st.data_editor(sell_init, num_rows="dynamic", use_container_width=True,
-                                   column_config=COL_CONFIG, hide_index=True, key="ed_sell")
+    # ── tabel input (TAB: Reguler vs Nego) ──
+    tab_rg, tab_tn = st.tabs(["📊 Pasar Reguler (flow utama)", "🔄 Pasar Nego (TN)"])
+
+    with tab_rg:
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**🟢 NET BUYER**")
+            buy_init = st.session_state.get("buy_table", EMPTY_TABLE.copy())
+            buy_edit = st.data_editor(buy_init, num_rows="dynamic", use_container_width=True,
+                                      column_config=COL_CONFIG, hide_index=True, key="ed_buy")
+        with c2:
+            st.markdown("**🔴 NET SELLER**")
+            sell_init = st.session_state.get("sell_table", EMPTY_TABLE.copy())
+            sell_edit = st.data_editor(sell_init, num_rows="dynamic", use_container_width=True,
+                                       column_config=COL_CONFIG, hide_index=True, key="ed_sell")
+
+    with tab_tn:
+        st.caption("**Pasar Nego (TN)** = transaksi 'di belakang layar'. Di Stockbit, pilih filter "
+                   "**Nego** di broker summary, copy datanya ke sini. Yang dibaca beda dari reguler: "
+                   "bukan net flow, tapi **perpindahan barang jumbo + di harga berapa** (diskon/premium). "
+                   "Berguna deteksi smart money mindahin barang diam-diam pas reguler keliatan distribusi.")
+        with st.expander("📋 Paste cepat data Nego", expanded=False):
+            paste_nego = st.text_area("Paste data Nego (KODE Val Lot Freq Avg)", height=120,
+                                      key="paste_nego",
+                                      placeholder="YU\t72.8B\t120.9K\t3\t6021\nCD\t1.2B\t1.6K\t1\t7325")
+            if st.button("➡️ Isi tabel Nego", key="fill_nego"):
+                pn = parse_stockbit_paste(paste_nego, "buy")
+                if pn is not None:
+                    st.session_state["nego_table"] = pn
+                    st.rerun()
+        st.markdown("**🔄 TRANSAKSI NEGO**")
+        nego_init = st.session_state.get("nego_table", EMPTY_TABLE.copy())
+        nego_edit = st.data_editor(nego_init, num_rows="dynamic", use_container_width=True,
+                                   column_config=COL_CONFIG, hide_index=True, key="ed_nego")
 
     run = st.button("🔍 ANALISA FLOW", type="primary", use_container_width=True)
 
     if run:
         buy_df = build_df_from_table(buy_edit)
         sell_df = build_df_from_table(sell_edit)
+        nego_df = build_df_from_table(nego_edit)
         if buy_df is None and sell_df is None:
-            st.error("Minimal isi salah satu: Net Buyer atau Net Seller.")
+            st.error("Minimal isi salah satu: Net Buyer atau Net Seller (di tab Pasar Reguler).")
             st.stop()
         # Smart Money metrics (otomatis dari broksum) — free float dari juta lot ke lot
         ff_lot = free_float_lot * 1e6 if free_float_lot > 0 else 0
         smart = compute_smart_money(buy_df, sell_df, last_price, free_float_lot=ff_lot)
+        nego = analyze_nego(nego_df, last_price)
         # big/retail net otomatis dari smart money (gak perlu input manual lagi)
         bandar = {"big_net": smart["big_net_val"], "retail_net": smart["retail_net_val"]}
         running = {"lifting": lifting, "hitting": hitting}
@@ -2123,6 +2221,7 @@ with _main:
             "buy_df": buy_df, "sell_df": sell_df, "bandar": bandar,
             "running": running, "notes": notes, "result": result,
             "smart": smart, "free_float_lot": free_float_lot, "laba": laba,
+            "nego": nego,
         }
         # reset narasi lama kalau analisa baru
         st.session_state.pop("narr_text", None)
@@ -2137,6 +2236,7 @@ with _main:
         result = A["result"]
         smart = A.get("smart", {})
         laba = A.get("laba")
+        nego = A.get("nego")
         card = get_tick_card(result)
 
         # ── TICK CARD (status warna) ──
@@ -2234,6 +2334,47 @@ with _main:
             st.caption(f"Top 3 akumulator: **{top3}** · "
                        + ("Control % butuh free float (isi di sidebar)" if ctrl is None
                           else f"barang terkunci {ctrl:.0f}% dari free float"))
+
+        # ── PASAR NEGO (TN): perpindahan barang di belakang layar ──
+        if nego and nego.get("total_val", 0) > 0:
+            st.markdown("<br>", unsafe_allow_html=True)
+            st.markdown("### 🔄 PASAR NEGO (TN) — Radar Belakang Layar")
+            vs = nego.get("vs_market_pct")
+            tot = nego["total_val"]
+            avg_tn = nego.get("avg_tn")
+            ncols = st.columns(3)
+            ncols[0].markdown(
+                f"<div class='metric-box'><div class='lbl'>Total Perpindahan</div>"
+                f"<div class='val' style='color:#e8b339;'>{fmt_value(tot)}</div>"
+                f"<div style='font-size:11px;color:#8b949e;'>"
+                f"{'JUMBO ⚠️' if nego.get('is_jumbo') else 'kecil/normal'}</div></div>",
+                unsafe_allow_html=True)
+            if avg_tn:
+                vcol = "#16c784" if (vs is not None and vs < -2) else "#f85149" if (vs is not None and vs > 2) else "#8b949e"
+                vtxt = f"{vs:+.1f}% vs pasar" if vs is not None else ""
+                ncols[1].markdown(
+                    f"<div class='metric-box'><div class='lbl'>Avg Harga TN</div>"
+                    f"<div class='val' style='color:{vcol};'>{avg_tn:,.0f}</div>"
+                    f"<div style='font-size:11px;color:{vcol};'>{vtxt}</div></div>",
+                    unsafe_allow_html=True)
+            big = nego.get("biggest")
+            if big:
+                ncols[2].markdown(
+                    f"<div class='metric-box'><div class='lbl'>Perantara Terbesar</div>"
+                    f"<div class='val' style='color:#58a6ff;'>{big[0]}</div>"
+                    f"<div style='font-size:11px;color:#8b949e;'>{fmt_value(big[1])}</div></div>",
+                    unsafe_allow_html=True)
+            if nego.get("verdict"):
+                vc = ("#16c784" if "DISKON" in nego["verdict"] else
+                      "#e8b339" if "PREMIUM" in nego["verdict"] else "#8b949e")
+                st.markdown(
+                    f"<div style='background:{vc}1a;border-left:3px solid {vc};"
+                    f"border-radius:4px;padding:10px 14px;margin:8px 0;'>"
+                    f"<span style='color:#d4d4d4;font-size:14px;'>💡 {nego['verdict']}</span></div>",
+                    unsafe_allow_html=True)
+            st.caption("⚠️ Hati-hati: TN kadang cuma crossing teknis (pindah portofolio, "
+                       "settlement) yang gak ada makna directional. Pakai sebagai radar tambahan, "
+                       "bukan sinyal tunggal.")
 
         # ── FUNDAMENTAL: tren laba bersih (timeframe Panjang) ──
         if laba:
@@ -2345,7 +2486,7 @@ with _main:
             if not narrative:
                 with st.spinner(f"{_bname} lagi bedah flow-nya (full Wyckoff)..."):
                     narrative = generate_ai_narrative(ticker, tf, result, buy_df, sell_df,
-                                                      last_price, bandar, running, notes, smart, laba)
+                                                      last_price, bandar, running, notes, smart, laba, nego)
                 st.session_state["narr_key"] = cache_key
                 st.session_state["narr_text"] = narrative
 
@@ -2442,3 +2583,4 @@ with _main:
                     st.error(f"❌ Gagal: {info}")
 
         st.caption("⚠️ Tool bantu baca flow, BUKAN sinyal beli/jual. Validasi sendiri + manajemen risiko.")
+
