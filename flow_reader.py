@@ -1751,6 +1751,17 @@ FUNDAMENTAL — LABA BERSIH (penting buat tesis jangka panjang):
 - Status: {'PROFITABLE' if laba['is_profitable'] else 'RUGI di periode terakhir'}{', pernah rugi di histori' if laba['any_loss'] else ', konsisten laba'}
 """
 
+    # ── catatan/konteks trader (berita, rumor, sentimen) — penting buat anti-news ──
+    notes_block = ""
+    if notes and notes.strip():
+        notes_block = f"""
+⚠️ CATATAN & KONTEKS DARI TRADER (WAJIB DIPERTIMBANGKAN):
+"{notes.strip()}"
+(Ini bisa berupa berita, rumor, kabar burung, aksi korporasi, atau sentimen pasar.
+Pakai info ini buat validasi silang dengan data flow — apakah pergerakan bandar
+KONSISTEN atau DIVERGEN dengan kabar ini.)
+"""
+
     prompt = f"""Lo analis flow saham IDX (Indonesia) SENIOR, spesialis metode Wyckoff + bandarmologi (baca pergerakan bandar lewat broker summary). Gaya lo tajam, jujur, gak basa-basi, gak promosi. Pakai Bahasa Indonesia santai gaya 'bro' tapi tetap berbobot.
 
 ═══════════════════════════════
@@ -1769,11 +1780,10 @@ AGREGAT:
 - Net flow: {('+' if net>=0 else '')+fmt_value(net)} ({'beli unggul' if net>0 else 'jual unggul' if net<0 else 'imbang'})
 - Big money net (proxy): {fmt_value(bandar.get('big_net', 0))} | Retail net (proxy): {fmt_value(bandar.get('retail_net', 0))}
 - Running/orderbook: lifting {running.get('lifting')} vs hitting {running.get('hitting')}
-- Catatan trader: {notes or '-'}
-{smart_block}{laba_block}
+{smart_block}{laba_block}{notes_block}
 ═══════════════════════════════
 METODOLOGI WAJIB (gaya bandarmologi forensik / smart money):
-1. ANTI-NEWS DIVERGENCE: kalau ada good news/pom-pom TAPI Top 3 broker net sell → tandai "JEBAKAN EXIT BANDAR". Jangan ketipu narasi.
+1. ANTI-NEWS DIVERGENCE: WAJIB pertimbangkan CATATAN/KONTEKS TRADER di atas (berita, rumor, kabar burung, sentimen). Kalau ada good news/pom-pom TAPI Top 3 broker net sell → tandai "JEBAKAN EXIT BANDAR". Kalau ada bad news TAPI bandar malah akumulasi → bisa jadi "buy the rumor" atau bandar tau kabar itu overblown. Kalau catatan trader nyebut rumor/aksi korporasi (right issue, akuisisi, dll), bahas dampaknya ke tesis. Jangan ketipu narasi, tapi JANGAN abaikan konteks yang dikasih trader.
 2. LIQUIDITY SWEEP / FAKE BREAKDOWN: kalau harga jebol support TAPI inventory smart money tetap naik/nampung → ini "Cleansing Retail" (sapu stop-loss ritel), justru momen entry, bukan sinyal jual.
 3. RISK SLICING (anti all-in): rekomendasi entry WAJIB bertahap (cth 20% di base, 30% saat stop-hunt, 50% saat konfirmasi breakout volume kering). DILARANG nyaranin all-in.
 4. TEKNIKAL = PELENGKAP, bukan patokan utama. Boleh sebut RSI/MA/support-resistance sebagai konteks, tapi FOKUS utama tetap di posisi harga vs bandar avg + tingkat kekeringan barang (control %).
@@ -2322,7 +2332,9 @@ with _main:
             st.info("💡 Narasi AI nonaktif. Isi key/token AI di sidebar (Gemini / GitHub / Ollama). "
                     "Skor + summary + chart tetap jalan tanpa ini.")
         else:
-            cache_key = f"{ticker}|{last_price}|{result['score']}|{_backend}"
+            # cache key termasuk notes + ada/tidaknya laba — biar ganti catatan/data = regenerate
+            _laba_sig = len(laba["data"]) if laba else 0
+            cache_key = f"{ticker}|{last_price}|{result['score']}|{_backend}|{hash(notes)}|{_laba_sig}"
             if st.session_state.get("narr_key") == cache_key and \
                st.session_state.get("narr_text") and \
                not st.session_state.get("narr_text", "").startswith("⚠️"):
