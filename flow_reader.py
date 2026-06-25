@@ -351,6 +351,85 @@ def to_num(x):
 
 
 # ════════════════════════════════════════════════════════════════════
+# SMART MONEY INVENTORY ENGINE — Absorption Rate, Bandar Avg, Control %
+# (terinspirasi metodologi bandarmologi forensik)
+# ════════════════════════════════════════════════════════════════════
+# broker yang DOMINAN dipakai ritel (buat misahin "uang receh" vs "big money")
+RETAIL_BROKERS = {"YP", "PD", "XC", "NI", "KK", "XL", "CC", "DR", "OD"}
+
+
+def compute_smart_money(buy_df, sell_df, last_price, free_float_lot=0,
+                        retail_set=None):
+    """
+    Hitung metrik smart money inventory dari broker summary.
+    Return dict: absorption_rate, control_pct, bandar_avg, top3, retail_net, dll.
+    Pakai 'val' sbg proxy net lot kalau lot gak ada (val ≈ lot×harga, rasio tetap valid).
+    """
+    retail = retail_set or RETAIL_BROKERS
+    out = {
+        "absorption_rate": None, "control_pct": None, "bandar_avg": None,
+        "top3_brokers": [], "top5_brokers": [], "retail_net_val": 0.0,
+        "big_net_val": 0.0, "dist_to_bandar_avg_pct": None, "total_buy_val": 0.0,
+    }
+    if buy_df is None or len(buy_df) == 0:
+        return out
+
+    # pakai 'lot' kalau ada & valid, else 'val' sebagai proxy
+    use_col = "lot" if ("lot" in buy_df.columns and buy_df["lot"].sum() > 0) else "val"
+
+    b = buy_df.copy()
+    total_buy = b[use_col].sum()
+    out["total_buy_val"] = float(buy_df["val"].sum())
+    if total_buy <= 0:
+        return out
+
+    # Top 3 & Top 5 akumulator (dari sisi beli)
+    top = b.nlargest(min(5, len(b)), use_col)
+    out["top3_brokers"] = top.head(3)["broker"].tolist()
+    out["top5_brokers"] = top["broker"].tolist()
+    top3_sum = top.head(3)[use_col].sum()
+    top5_sum = top.head(5)[use_col].sum()
+
+    # net retail (broker ritel di sisi beli - sisi jual)
+    retail_buy = b[b["broker"].isin(retail)][use_col].sum()
+    retail_sell = 0.0
+    if sell_df is not None and len(sell_df) > 0:
+        sc = "lot" if ("lot" in sell_df.columns and sell_df["lot"].sum() > 0) else "val"
+        # samakan kolom proxy
+        if sc in sell_df.columns:
+            retail_sell = sell_df[sell_df["broker"].isin(retail)][sc].sum()
+    retail_net = retail_buy - retail_sell
+    out["retail_net_val"] = float(retail_net)
+    out["big_net_val"] = float(top3_sum - retail_buy)  # proxy big vs retail
+
+    # ── Absorption Rate: serapan Top3 dikoreksi porsi ritel ──
+    # makin tinggi = barang makin diserap raksasa (bukan ritel)
+    retail_frac = retail_buy / total_buy if total_buy else 0
+    top3_frac = top3_sum / total_buy if total_buy else 0
+    out["absorption_rate"] = round(top3_frac * (1 - retail_frac), 3)
+
+    # ── Bandar Avg Cost: weighted avg price Top 3 ──
+    if "avg" in top.columns:
+        t3 = top.head(3)
+        w = t3[use_col]
+        if w.sum() > 0 and (t3["avg"] > 0).any():
+            valid = t3[t3["avg"] > 0]
+            if len(valid) and valid[use_col].sum() > 0:
+                bandar_avg = (valid["avg"] * valid[use_col]).sum() / valid[use_col].sum()
+                out["bandar_avg"] = round(float(bandar_avg), 2)
+                if last_price > 0:
+                    out["dist_to_bandar_avg_pct"] = round(
+                        (last_price - bandar_avg) / bandar_avg * 100, 2)
+
+    # ── Smart Money Control %: Top5 net vs free float ──
+    # butuh free_float dalam LOT. kalau gak diisi, skip.
+    if free_float_lot and free_float_lot > 0 and use_col == "lot":
+        out["control_pct"] = round(top5_sum / free_float_lot * 100, 2)
+
+    return out
+
+
+# ════════════════════════════════════════════════════════════════════
 # SCORING ENGINE (rule-based) — inti baca flow
 # ════════════════════════════════════════════════════════════════════
 def compute_flow_score(buy_df, sell_df, last_price, running, bandar):
@@ -1483,11 +1562,34 @@ def _enrich_broker_data(buy_df, sell_df, last_price):
     return "\n".join(lines)
 
 
-def generate_ai_narrative(ticker, tf, result, buy_df, sell_df, last_price, bandar, running, notes):
+def generate_ai_narrative(ticker, tf, result, buy_df, sell_df, last_price, bandar, running, notes, smart=None):
     broker_detail = _enrich_broker_data(buy_df, sell_df, last_price)
     tot_buy = buy_df["val"].sum() if buy_df is not None else 0
     tot_sell = sell_df["val"].sum() if sell_df is not None else 0
     net = tot_buy - tot_sell
+
+    # ── blok smart money inventory (kalau ada) ──
+    smart_block = ""
+    if smart and smart.get("absorption_rate") is not None:
+        ar = smart["absorption_rate"]
+        ctrl = smart.get("control_pct")
+        bavg = smart.get("bandar_avg")
+        dist = smart.get("dist_to_bandar_avg_pct")
+        ar_lbl = ('SERAPAN MUTLAK oleh raksasa' if ar >= 0.6
+                  else 'serapan sedang' if ar >= 0.35 else 'tersebar/lemah')
+        bavg_str = f"{bavg:,.0f}" if bavg else "n/a"
+        dist_str = f" (harga sekarang {dist:+.1f}% vs avg bandar)" if dist is not None else ""
+        ctrl_str = (f"{ctrl:.1f}% dari free float" if ctrl is not None
+                    else "n/a (free float belum diisi)")
+        dry = "→ BARANG KERING, rentan digoreng!" if (ctrl and ctrl > 50) else ""
+        top3_str = ", ".join(smart.get("top3_brokers", []))
+        smart_block = f"""
+SMART MONEY INVENTORY (hasil kalkulasi forensik):
+- Absorption Rate: {ar:.0%} ({ar_lbl})
+- Top 3 Akumulator: {top3_str}
+- Bandar Avg Cost (Top 3): {bavg_str}{dist_str}
+- Smart Money Control: {ctrl_str} {dry}
+"""
 
     prompt = f"""Lo analis flow saham IDX (Indonesia) SENIOR, spesialis metode Wyckoff + bandarmologi (baca pergerakan bandar lewat broker summary). Gaya lo tajam, jujur, gak basa-basi, gak promosi. Pakai Bahasa Indonesia santai gaya 'bro' tapi tetap berbobot.
 
@@ -1505,9 +1607,16 @@ AGREGAT:
 - Total nilai BELI: {fmt_value(tot_buy)}
 - Total nilai JUAL: {fmt_value(tot_sell)}
 - Net flow: {('+' if net>=0 else '')+fmt_value(net)} ({'beli unggul' if net>0 else 'jual unggul' if net<0 else 'imbang'})
-- Big money net: {bandar.get('big_net')} lot | Retail net: {bandar.get('retail_net')} lot
-- Running trade: lifting offer {running.get('lifting')} vs hitting bid {running.get('hitting')}
+- Big money net (proxy): {fmt_value(bandar.get('big_net', 0))} | Retail net (proxy): {fmt_value(bandar.get('retail_net', 0))}
+- Running/orderbook: lifting {running.get('lifting')} vs hitting {running.get('hitting')}
 - Catatan trader: {notes or '-'}
+{smart_block}
+═══════════════════════════════
+METODOLOGI WAJIB (gaya bandarmologi forensik / smart money):
+1. ANTI-NEWS DIVERGENCE: kalau ada good news/pom-pom TAPI Top 3 broker net sell → tandai "JEBAKAN EXIT BANDAR". Jangan ketipu narasi.
+2. LIQUIDITY SWEEP / FAKE BREAKDOWN: kalau harga jebol support TAPI inventory smart money tetap naik/nampung → ini "Cleansing Retail" (sapu stop-loss ritel), justru momen entry, bukan sinyal jual.
+3. RISK SLICING (anti all-in): rekomendasi entry WAJIB bertahap (cth 20% di base, 30% saat stop-hunt, 50% saat konfirmasi breakout volume kering). DILARANG nyaranin all-in.
+4. TEKNIKAL = PELENGKAP, bukan patokan utama. Boleh sebut RSI/MA/support-resistance sebagai konteks, tapi FOKUS utama tetap di posisi harga vs bandar avg + tingkat kekeringan barang (control %).
 
 ═══════════════════════════════
 TUGAS LO — tulis analisa SUPER LENGKAP & MENDALAM dengan struktur ini:
@@ -1525,7 +1634,7 @@ Tentukan fase Wyckoff yang paling mungkin (Accumulation A-E / Markup / Distribut
 Kasih 2 skenario (bullish & bearish): apa trigger-nya, ke mana arah harga, berapa lama biasanya main di fase ini. Sebut level/zona kunci yang harus dipantau (pakai angka harga & avg broker sebagai acuan).
 
 ## 5. ACTION PLAN
-Rekomendasi sikap konkret: WAIT / akumulasi bertahap / hindari / siap entry. Plus kondisi spesifik yang bikin lo ganti pandangan.
+Rekomendasi sikap konkret: WAIT / akumulasi bertahap / hindari / siap entry. WAJIB pakai RISK SLICING — bagi entry jadi 3 tahap (base / stop-hunt / konfirmasi), JANGAN all-in. Sebut kondisi spesifik yang bikin lo ganti pandangan.
 
 ## 6. RISK NOTE
 Apa yang bikin tesis ini GUGUR. Sinyal bahaya yang harus diwaspadai (mis. broker akumulator tiba-tiba net sell, harga jebol level X).
@@ -1557,15 +1666,13 @@ with st.sidebar:
     tf = st.selectbox("Timeframe", ["Pendek (intraday/daily)", "Sedang (mingguan)", "Panjang (bulanan)"])
 
     st.markdown("---")
-    st.markdown("### 🏦 BANDAR (opsional)")
-    st.caption("Skip aja kalau males — dari broker summary udah ketauan bandarnya. "
-               "Isi cuma kalau lo punya data Bandar Detector (Stockbit) buat nambah presisi.")
-    big_net = st.number_input("Big Money Net (lot, +/−)", value=0.0, step=100.0,
-                              help="Dari Bandar Detector Stockbit: Net Volume sisi 'Big Acc'. "
-                                   "Positif = big player akumulasi. Kosongin = skip.")
-    retail_net = st.number_input("Retail Net (lot, +/−)", value=0.0, step=100.0,
-                                 help="Net volume ritel. Positif = ritel beli (sering kontrarian "
-                                      "vs bandar). Kosongin = skip.")
+    st.markdown("### 🧠 SMART MONEY (opsional)")
+    st.caption("Buat hitung Smart Money Control % (seberapa 'kering' barang di pasar). "
+               "Isi free float kalau punya datanya dari RTI/Stockbit.")
+    free_float_lot = st.number_input("Free Float (juta lot)", min_value=0.0, value=0.0, step=1.0,
+                                     help="Free float saham dalam JUTA lot (dari RTI/Stockbit Key Stats). "
+                                          "Cth: free float 9.23 miliar lembar = 92.3 juta lot → isi 92.3. "
+                                          "Kosongin = skip Control %.")
 
     st.markdown("---")
     st.markdown("### 📊 ORDERBOOK (opsional)")
@@ -1813,15 +1920,19 @@ with _main:
         if buy_df is None and sell_df is None:
             st.error("Minimal isi salah satu: Net Buyer atau Net Seller.")
             st.stop()
-        bandar = {"big_net": big_net, "retail_net": retail_net}
+        # Smart Money metrics (otomatis dari broksum) — free float dari juta lot ke lot
+        ff_lot = free_float_lot * 1e6 if free_float_lot > 0 else 0
+        smart = compute_smart_money(buy_df, sell_df, last_price, free_float_lot=ff_lot)
+        # big/retail net otomatis dari smart money (gak perlu input manual lagi)
+        bandar = {"big_net": smart["big_net_val"], "retail_net": smart["retail_net_val"]}
         running = {"lifting": lifting, "hitting": hitting}
         result = compute_flow_score(buy_df, sell_df, last_price, running, bandar)
         # SIMPAN semua hasil ke session_state biar gak hilang pas rerun
-        # (rerun terjadi tiap pencet toggle/tombol — ini kunci fix bug kirim & toggle)
         st.session_state["analysis"] = {
             "ticker": ticker, "tf": tf, "last_price": last_price,
             "buy_df": buy_df, "sell_df": sell_df, "bandar": bandar,
             "running": running, "notes": notes, "result": result,
+            "smart": smart, "free_float_lot": free_float_lot,
         }
         # reset narasi lama kalau analisa baru
         st.session_state.pop("narr_text", None)
@@ -1834,6 +1945,7 @@ with _main:
         buy_df = A["buy_df"]; sell_df = A["sell_df"]
         bandar = A["bandar"]; running = A["running"]; notes = A["notes"]
         result = A["result"]
+        smart = A.get("smart", {})
         card = get_tick_card(result)
 
         # ── TICK CARD (status warna) ──
@@ -1886,6 +1998,51 @@ with _main:
                 f"<div style='color:{sc_color};font-size:12px;'>{sc:+.1f} pts</div></div>",
                 unsafe_allow_html=True,
             )
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # ── SMART MONEY INVENTORY ──
+        if smart and smart.get("absorption_rate") is not None:
+            st.markdown("### 🧠 SMART MONEY INVENTORY")
+            ar = smart["absorption_rate"]
+            ctrl = smart.get("control_pct")
+            bavg = smart.get("bandar_avg")
+            dist = smart.get("dist_to_bandar_avg_pct")
+            top3 = ", ".join(smart.get("top3_brokers", []))
+
+            # interpretasi absorption
+            if ar >= 0.6:
+                ar_txt, ar_col = "SERAPAN MUTLAK (barang dikuasai raksasa)", "#16c784"
+            elif ar >= 0.35:
+                ar_txt, ar_col = "Serapan sedang", "#e8b339"
+            else:
+                ar_txt, ar_col = "Serapan lemah / tersebar", "#8b949e"
+
+            sm_cols = st.columns(3)
+            sm_cols[0].markdown(
+                f"<div class='metric-box'><div class='lbl'>Absorption Rate</div>"
+                f"<div class='val' style='color:{ar_col};'>{ar:.0%}</div>"
+                f"<div style='color:{ar_col};font-size:11px;'>{ar_txt}</div></div>",
+                unsafe_allow_html=True)
+            if bavg:
+                dcol = "#16c784" if (dist is not None and dist > 0) else "#f85149"
+                dtxt = f"harga {dist:+.1f}% vs avg bandar" if dist is not None else ""
+                sm_cols[1].markdown(
+                    f"<div class='metric-box'><div class='lbl'>Bandar Avg (Top 3)</div>"
+                    f"<div class='val' style='color:{dcol};'>{bavg:,.0f}</div>"
+                    f"<div style='color:{dcol};font-size:11px;'>{dtxt}</div></div>",
+                    unsafe_allow_html=True)
+            if ctrl is not None:
+                cc = "#f85149" if ctrl > 50 else "#e8b339" if ctrl > 30 else "#16c784"
+                ctxt = "BARANG KERING!" if ctrl > 50 else "kontrol sedang" if ctrl > 30 else "barang longgar"
+                sm_cols[2].markdown(
+                    f"<div class='metric-box'><div class='lbl'>SM Control %</div>"
+                    f"<div class='val' style='color:{cc};'>{ctrl:.1f}%</div>"
+                    f"<div style='color:{cc};font-size:11px;'>{ctxt}</div></div>",
+                    unsafe_allow_html=True)
+            st.caption(f"Top 3 akumulator: **{top3}** · "
+                       + ("Control % butuh free float (isi di sidebar)" if ctrl is None
+                          else f"barang terkunci {ctrl:.0f}% dari free float"))
 
         st.markdown("<br>", unsafe_allow_html=True)
 
@@ -1951,7 +2108,7 @@ with _main:
             if not narrative:
                 with st.spinner(f"{_bname} lagi bedah flow-nya (full Wyckoff)..."):
                     narrative = generate_ai_narrative(ticker, tf, result, buy_df, sell_df,
-                                                      last_price, bandar, running, notes)
+                                                      last_price, bandar, running, notes, smart)
                 st.session_state["narr_key"] = cache_key
                 st.session_state["narr_text"] = narrative
 
