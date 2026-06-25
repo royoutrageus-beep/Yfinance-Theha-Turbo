@@ -1809,10 +1809,13 @@ Rekomendasi sikap konkret: WAIT / akumulasi bertahap / hindari / siap entry. WAJ
 
 ## 6. RISK NOTE
 Apa yang bikin tesis ini GUGUR. Sinyal bahaya yang harus diwaspadai (mis. broker akumulator tiba-tiba net sell, harga jebol level X).
+{"## 7. VALIDASI CATATAN TRADER" if (notes and notes.strip()) else ""}
+{"Trader kasih catatan/konteks di atas (lihat bagian CATATAN & KONTEKS). WAJIB bahas eksplisit di sini: apakah info itu KONSISTEN atau DIVERGEN sama data flow & bandar? Kalau trader sebut faktor eksternal (kurs, makro, outflow asing) — kaitkan dengan pola distribusi/akumulasi yang lo lihat. Kalau trader sebut fundamental solid — cek apakah bandar lokal manfaatin weakness buat akumulasi. Kasih kesimpulan: catatan ini MEMPERKUAT atau MELEMAHKAN tesis flow lo." if (notes and notes.strip()) else ""}
 
 PENTING:
 - Jujur kalau data ambigu atau confidence rendah — jangan maksa kasih sinyal kuat dari data tipis.
 - Ini timeframe {tf}, sesuaikan horizon analisa (panjang = bulanan, jangan kasih level intraday).
+{"- WAJIB bahas catatan/konteks trader yang dikasih — jangan diabaikan, itu info penting buat validasi silang." if (notes and notes.strip()) else ""}
 - Tutup dengan reminder bahwa ini alat bantu baca flow, keputusan & risk management di tangan trader."""
 
     return call_ai(prompt, max_tokens=8192)
@@ -2363,6 +2366,12 @@ with _main:
                 narrative = None
             elif narrative:
                 st.markdown(narrative)
+                # tombol regenerate manual (paksa AI mikir ulang dgn data/catatan terkini)
+                if st.button("🔄 Regenerate analisa AI", help="Paksa AI bikin ulang "
+                             "(berguna kalau lo baru ubah catatan, harga, atau data)"):
+                    st.session_state.pop("narr_text", None)
+                    st.session_state.pop("narr_key", None)
+                    st.rerun()
 
         # ── KIRIM KE TELEGRAM ──
         st.markdown("---")
@@ -2433,4 +2442,3 @@ with _main:
                     st.error(f"❌ Gagal: {info}")
 
         st.caption("⚠️ Tool bantu baca flow, BUKAN sinyal beli/jual. Validasi sendiri + manajemen risiko.")
-
