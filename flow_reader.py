@@ -432,6 +432,94 @@ def compute_smart_money(buy_df, sell_df, last_price, free_float_lot=0,
 # ════════════════════════════════════════════════════════════════════
 # SCORING ENGINE (rule-based) — inti baca flow
 # ════════════════════════════════════════════════════════════════════
+def parse_laba(text):
+    """
+    Parse input laba bersih per periode. Return list of (label, nilai_miliar).
+    Format fleksibel: '2024: 261' / '2024 261' / 'Q1-26: 41' per baris.
+    """
+    if not text or not text.strip():
+        return []
+    out = []
+    for line in text.strip().split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        # pisah label : nilai  (atau label  nilai)
+        if ":" in line:
+            parts = line.split(":", 1)
+        else:
+            # ambil angka terakhir sebagai nilai, sisanya label
+            import re
+            m = re.match(r"^(.*?)([-+]?\d[\d.,]*)\s*$", line)
+            if m:
+                parts = [m.group(1), m.group(2)]
+            else:
+                continue
+        if len(parts) != 2:
+            continue
+        label = parts[0].strip()
+        # nilai laba: satuan SUDAH miliar, ambil angka apa adanya (jangan parse M/B/T
+        # biar "268" gak ke-treat aneh; "268 M" → buang M, tetap 268)
+        raw = parts[1].strip()
+        import re as _re
+        m2 = _re.search(r"[-+]?\d[\d.,]*", raw)
+        if not m2:
+            continue
+        numstr = m2.group(0)
+        # normalisasi koma desimal (1-2 digit) vs ribuan (3 digit)
+        if "," in numstr and "." in numstr:
+            numstr = numstr.replace(",", "")
+        elif "," in numstr:
+            after = numstr.split(",")[-1]
+            numstr = numstr.replace(",", "") if len(after) == 3 else numstr.replace(",", ".")
+        try:
+            val = float(numstr)
+        except ValueError:
+            continue
+        if label:
+            out.append((label, val))
+    return out
+
+
+def analyze_laba(laba_list):
+    """
+    Analisa tren laba. Return dict: trend, latest, growth_pct, summary, is_profitable.
+    """
+    if not laba_list or len(laba_list) == 0:
+        return None
+    vals = [v for _, v in laba_list]
+    latest = vals[-1]
+    first = vals[0]
+    out = {
+        "data": laba_list,
+        "latest": latest,
+        "is_profitable": latest > 0,
+        "trend": "datar",
+        "growth_pct": None,
+        "all_positive": all(v > 0 for v in vals),
+        "any_loss": any(v < 0 for v in vals),
+    }
+    # tren: bandingkan rata-rata paruh akhir vs awal (kalau >=3 data)
+    if len(vals) >= 2 and first != 0:
+        out["growth_pct"] = (latest - first) / abs(first) * 100
+    # arah tren sederhana: hitung naik vs turun antar periode
+    ups = sum(1 for i in range(1, len(vals)) if vals[i] > vals[i-1])
+    downs = sum(1 for i in range(1, len(vals)) if vals[i] < vals[i-1])
+    if ups > downs:
+        out["trend"] = "naik"
+    elif downs > ups:
+        out["trend"] = "turun"
+    # tren membaik/memburuk
+    if out["any_loss"] and latest > 0:
+        out["trend"] = "turnaround (rugi→laba)"
+    elif not out["any_loss"] and out["trend"] == "naik":
+        out["trend"] = "tumbuh konsisten"
+    return out
+
+
+# ════════════════════════════════════════════════════════════════════
+# (lanjut scoring di bawah)
+# ════════════════════════════════════════════════════════════════════
 def compute_flow_score(buy_df, sell_df, last_price, running, bandar):
     """
     Hitung Flow Score 0–100 dari komponen:
@@ -1163,7 +1251,7 @@ def _wrap_text(draw, text, font, max_w):
 
 
 def render_infographic_pil(ticker, tf, result, card, summary, buy_df, sell_df,
-                           last_price, narrative, scale=2):
+                           last_price, narrative, scale=2, smart=None, laba=None):
     """
     Render infografis pakai Pillow MURNI (gak butuh wkhtml/Chrome/kaleido).
     Teknik: render di koordinat logical 1x, lalu canvas di-supersample S kali
@@ -1385,6 +1473,65 @@ def render_infographic_pil(ticker, tf, result, card, summary, buy_df, sell_df,
     yb2 = broker_table(right_x, y, sell_df, "#f85149", "NET SELLER")
     y = max(yb1, yb2) + 18
 
+    # ── SMART MONEY METRICS (kalau ada) ──
+    if smart and smart.get("absorption_rate") is not None:
+        ar = smart["absorption_rate"]
+        bavg = smart.get("bandar_avg")
+        ctrl = smart.get("control_pct")
+        sm_h = 78
+        panel(M, y, W - 2 * M, sm_h)
+        d.text((M + 18, y + 12), "SMART MONEY INVENTORY", font=f_h, fill=GOLD)
+        cellw = (W - 2 * M) // 3
+        ar_col = "#16c784" if ar >= 0.6 else "#e8b339" if ar >= 0.35 else "#8b949e"
+        d.text((M + 18, y + 40), "Absorption", font=f_small, fill=MUTE)
+        d.text((M + 18, y + 54), f"{ar:.0%}", font=f_bodyb, fill=_hex(ar_col))
+        if bavg:
+            d.text((M + 18 + cellw, y + 40), "Bandar Avg (Top3)", font=f_small, fill=MUTE)
+            d.text((M + 18 + cellw, y + 54), f"{bavg:,.0f}", font=f_bodyb, fill=TXT)
+        if ctrl is not None:
+            cc = "#f85149" if ctrl > 50 else "#e8b339" if ctrl > 30 else "#16c784"
+            d.text((M + 18 + 2*cellw, y + 40), "SM Control", font=f_small, fill=MUTE)
+            d.text((M + 18 + 2*cellw, y + 54), f"{ctrl:.1f}%", font=f_bodyb, fill=_hex(cc))
+        y += sm_h + 18
+
+    # ── FUNDAMENTAL LABA (kalau ada) ──
+    if laba and laba.get("data"):
+        data = laba["data"]
+        lab_h = 130
+        panel(M, y, W - 2 * M, lab_h)
+        trend = laba["trend"]
+        tcol = ("#16c784" if ("tumbuh" in trend or "naik" in trend or "turnaround" in trend)
+                else "#f85149" if "turun" in trend else "#e8b339")
+        d.text((M + 18, y + 12), "FUNDAMENTAL - LABA BERSIH", font=f_h, fill=GOLD)
+        d.text((W - M - 18, y + 14), f"Tren: {clean_emoji(trend).upper()}",
+               font=f_bodyb, fill=_hex(tcol), anchor="ra")
+        # mini bar chart laba
+        vals = [v for _, v in data]
+        labels = [l for l, _ in data]
+        if vals:
+            maxv = max(abs(v) for v in vals) or 1
+            n = len(vals)
+            chart_x = M + 18
+            chart_w = W - 2 * M - 36
+            bw = min(chart_w / max(n, 1) * 0.6, 80)
+            gap = (chart_w - bw * n) / max(n, 1)
+            base_y = y + 100  # garis nol
+            bar_max_h = 50
+            for i, (lb, v) in enumerate(zip(labels, vals)):
+                bx = chart_x + i * (bw + gap) + gap / 2
+                bh = abs(v) / maxv * bar_max_h
+                bcol = "#16c784" if v >= 0 else "#f85149"
+                if v >= 0:
+                    d.rectangle([bx, base_y - bh, bx + bw, base_y], fill=_hex(bcol))
+                else:
+                    d.rectangle([bx, base_y, bx + bw, base_y + bh], fill=_hex(bcol))
+                # label periode + nilai
+                d.text((bx + bw/2, base_y + bar_max_h + 6), clean_emoji(str(lb)),
+                       font=f_small, fill=MUTE, anchor="ma")
+                d.text((bx + bw/2, (base_y - bh - 16) if v >= 0 else (base_y + bh + 2)),
+                       f"{v:.0f}", font=f_small, fill=TXT, anchor="ma")
+        y += lab_h + 18
+
     # ── NARASI AI ──
     if narrative and not narrative.startswith("⚠️"):
         clean = clean_emoji(narrative.replace("##", "").replace("**", "").replace("*", "").replace("`", ""))
@@ -1562,7 +1709,7 @@ def _enrich_broker_data(buy_df, sell_df, last_price):
     return "\n".join(lines)
 
 
-def generate_ai_narrative(ticker, tf, result, buy_df, sell_df, last_price, bandar, running, notes, smart=None):
+def generate_ai_narrative(ticker, tf, result, buy_df, sell_df, last_price, bandar, running, notes, smart=None, laba=None):
     broker_detail = _enrich_broker_data(buy_df, sell_df, last_price)
     tot_buy = buy_df["val"].sum() if buy_df is not None else 0
     tot_sell = sell_df["val"].sum() if sell_df is not None else 0
@@ -1591,6 +1738,19 @@ SMART MONEY INVENTORY (hasil kalkulasi forensik):
 - Smart Money Control: {ctrl_str} {dry}
 """
 
+    # ── blok fundamental laba (kalau ada, biasanya timeframe panjang) ──
+    laba_block = ""
+    if laba and laba.get("data"):
+        rows = " | ".join(f"{l}: {fmt_value(v*1e9)}" for l, v in laba["data"])
+        growth = laba.get("growth_pct")
+        gstr = f", growth {growth:+.0f}% (periode awal→akhir)" if growth is not None else ""
+        laba_block = f"""
+FUNDAMENTAL — LABA BERSIH (penting buat tesis jangka panjang):
+- Data: {rows}
+- Tren: {laba['trend']}{gstr}
+- Status: {'PROFITABLE' if laba['is_profitable'] else 'RUGI di periode terakhir'}{', pernah rugi di histori' if laba['any_loss'] else ', konsisten laba'}
+"""
+
     prompt = f"""Lo analis flow saham IDX (Indonesia) SENIOR, spesialis metode Wyckoff + bandarmologi (baca pergerakan bandar lewat broker summary). Gaya lo tajam, jujur, gak basa-basi, gak promosi. Pakai Bahasa Indonesia santai gaya 'bro' tapi tetap berbobot.
 
 ═══════════════════════════════
@@ -1610,13 +1770,14 @@ AGREGAT:
 - Big money net (proxy): {fmt_value(bandar.get('big_net', 0))} | Retail net (proxy): {fmt_value(bandar.get('retail_net', 0))}
 - Running/orderbook: lifting {running.get('lifting')} vs hitting {running.get('hitting')}
 - Catatan trader: {notes or '-'}
-{smart_block}
+{smart_block}{laba_block}
 ═══════════════════════════════
 METODOLOGI WAJIB (gaya bandarmologi forensik / smart money):
 1. ANTI-NEWS DIVERGENCE: kalau ada good news/pom-pom TAPI Top 3 broker net sell → tandai "JEBAKAN EXIT BANDAR". Jangan ketipu narasi.
 2. LIQUIDITY SWEEP / FAKE BREAKDOWN: kalau harga jebol support TAPI inventory smart money tetap naik/nampung → ini "Cleansing Retail" (sapu stop-loss ritel), justru momen entry, bukan sinyal jual.
 3. RISK SLICING (anti all-in): rekomendasi entry WAJIB bertahap (cth 20% di base, 30% saat stop-hunt, 50% saat konfirmasi breakout volume kering). DILARANG nyaranin all-in.
 4. TEKNIKAL = PELENGKAP, bukan patokan utama. Boleh sebut RSI/MA/support-resistance sebagai konteks, tapi FOKUS utama tetap di posisi harga vs bandar avg + tingkat kekeringan barang (control %).
+5. VALIDASI FUNDAMENTAL (kalau ada data laba): cek apakah akumulasi bandar NYAMBUNG sama fundamental. Bandar akumulasi + laba tumbuh = tesis kuat (real value). Bandar akumulasi TAPI laba anjlok/rugi = waspada, bisa murni gorengan teknikal atau bandar tau info yang belum keluar. Sebut eksplisit konfluen atau divergence-nya.
 
 ═══════════════════════════════
 TUGAS LO — tulis analisa SUPER LENGKAP & MENDALAM dengan struktur ini:
@@ -1682,6 +1843,20 @@ with st.sidebar:
                               help="Total lot yang lifting offer (beli agresif angkat harga).")
     hitting = st.number_input("Hitting Bid (lot, agresif jual)", min_value=0.0, value=0.0, step=10.0,
                               help="Total lot yang hitting bid (jual agresif tekan harga).")
+
+    # ── FUNDAMENTAL: laba bersih per kuartal — KHUSUS timeframe Panjang ──
+    laba_input = ""
+    if tf.startswith("Panjang"):
+        st.markdown("---")
+        st.markdown("### 💰 FUNDAMENTAL — Laba Bersih")
+        st.caption("Khusus jangka panjang: tren laba bersih per kuartal/tahun. "
+                   "AI pakai ini buat validasi — akumulasi bandar didukung fundamental atau enggak. "
+                   "Format bebas, 1 periode per baris: `label: nilai`")
+        laba_input = st.text_area(
+            "Laba bersih (miliar Rp)", height=140,
+            placeholder="2022: 16\n2023: 77\n2024: 261\n2025: 268\nQ1-26: 41",
+            help="Ambil dari Stockbit Key Stats > Net Income. Satuan miliar. "
+                 "Boleh per tahun, per kuartal, atau campur. Kosongin = skip fundamental.")
 
     st.markdown("---")
     notes = st.text_area("📝 Catatan / konteks", placeholder="cth: lagi di support kuat, abis breakout, dll")
@@ -1927,12 +2102,14 @@ with _main:
         bandar = {"big_net": smart["big_net_val"], "retail_net": smart["retail_net_val"]}
         running = {"lifting": lifting, "hitting": hitting}
         result = compute_flow_score(buy_df, sell_df, last_price, running, bandar)
+        # fundamental laba (cuma diisi kalau timeframe Panjang)
+        laba = analyze_laba(parse_laba(laba_input)) if laba_input else None
         # SIMPAN semua hasil ke session_state biar gak hilang pas rerun
         st.session_state["analysis"] = {
             "ticker": ticker, "tf": tf, "last_price": last_price,
             "buy_df": buy_df, "sell_df": sell_df, "bandar": bandar,
             "running": running, "notes": notes, "result": result,
-            "smart": smart, "free_float_lot": free_float_lot,
+            "smart": smart, "free_float_lot": free_float_lot, "laba": laba,
         }
         # reset narasi lama kalau analisa baru
         st.session_state.pop("narr_text", None)
@@ -1946,6 +2123,7 @@ with _main:
         bandar = A["bandar"]; running = A["running"]; notes = A["notes"]
         result = A["result"]
         smart = A.get("smart", {})
+        laba = A.get("laba")
         card = get_tick_card(result)
 
         # ── TICK CARD (status warna) ──
@@ -2044,6 +2222,50 @@ with _main:
                        + ("Control % butuh free float (isi di sidebar)" if ctrl is None
                           else f"barang terkunci {ctrl:.0f}% dari free float"))
 
+        # ── FUNDAMENTAL: tren laba bersih (timeframe Panjang) ──
+        if laba:
+            st.markdown("<br>", unsafe_allow_html=True)
+            st.markdown("### 💰 FUNDAMENTAL — Tren Laba Bersih")
+            trend = laba["trend"]
+            tcol = ("#16c784" if "tumbuh" in trend or "naik" in trend or "turnaround" in trend
+                    else "#f85149" if "turun" in trend else "#e8b339")
+            f_cols = st.columns([2, 1, 1])
+            # mini bar chart tren laba
+            import plotly.graph_objects as go
+            labels = [l for l, _ in laba["data"]]
+            vals = [v for _, v in laba["data"]]
+            bar_colors = ["#16c784" if v >= 0 else "#f85149" for v in vals]
+            fig_laba = go.Figure(go.Bar(x=labels, y=vals, marker_color=bar_colors,
+                                        text=[fmt_value(v*1e9) for v in vals],
+                                        textposition="outside"))
+            fig_laba.update_layout(
+                height=220, margin=dict(l=10, r=10, t=10, b=10),
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                font=dict(color="#e6edf3"), yaxis=dict(title="Laba (miliar)", gridcolor="#1e2530"),
+                xaxis=dict(showgrid=False))
+            f_cols[0].plotly_chart(fig_laba, use_container_width=True)
+            f_cols[1].markdown(
+                f"<div class='metric-box'><div class='lbl'>Tren</div>"
+                f"<div class='val' style='color:{tcol};font-size:18px;'>{trend.upper()}</div></div>",
+                unsafe_allow_html=True)
+            growth = laba.get("growth_pct")
+            if growth is not None:
+                gcol = "#16c784" if growth >= 0 else "#f85149"
+                f_cols[2].markdown(
+                    f"<div class='metric-box'><div class='lbl'>Growth (awal→akhir)</div>"
+                    f"<div class='val' style='color:{gcol};'>{growth:+.0f}%</div></div>",
+                    unsafe_allow_html=True)
+            # warning kalau bandar akumulasi tapi laba jelek
+            if smart and smart.get("absorption_rate", 0) and smart["absorption_rate"] >= 0.5:
+                if laba["any_loss"] or trend == "turun":
+                    st.warning("⚠️ **Divergence**: bandar lagi akumulasi kuat TAPI fundamental "
+                               "(laba) lagi jelek/turun. Bisa jadi murni main teknikal/gorengan, "
+                               "atau bandar tau sesuatu yang belum keluar di laporan. Hati-hati, "
+                               "validasi lebih lanjut.")
+                elif "tumbuh" in trend or "turnaround" in trend:
+                    st.success("✅ **Konfluen**: bandar akumulasi DAN fundamental (laba) membaik. "
+                               "Tesis jangka panjang lebih kuat — flow nyambung sama kinerja.")
+
         st.markdown("<br>", unsafe_allow_html=True)
 
         # ── SUMMARY SPESIFIK (siapa terkuat + arah) ──
@@ -2108,7 +2330,7 @@ with _main:
             if not narrative:
                 with st.spinner(f"{_bname} lagi bedah flow-nya (full Wyckoff)..."):
                     narrative = generate_ai_narrative(ticker, tf, result, buy_df, sell_df,
-                                                      last_price, bandar, running, notes, smart)
+                                                      last_price, bandar, running, notes, smart, laba)
                 st.session_state["narr_key"] = cache_key
                 st.session_state["narr_text"] = narrative
 
@@ -2150,7 +2372,8 @@ with _main:
                 with st.spinner("Render infografis..."):
                     try:
                         preview = render_infographic_pil(ticker, tf, result, card, summary,
-                                                         buy_df, sell_df, last_price, narrative)
+                                                         buy_df, sell_df, last_price, narrative,
+                                                         smart=smart, laba=laba)
                     except Exception as e:
                         preview = None
                         st.error(f"Gagal render infografis: {e}")
@@ -2171,7 +2394,8 @@ with _main:
                         is_pdf = fmt_choice.startswith("📄")
                         try:
                             png = render_infographic_pil(ticker, tf, result, card, summary,
-                                                        buy_df, sell_df, last_price, narrative)
+                                                        buy_df, sell_df, last_price, narrative,
+                                                        smart=smart, laba=laba)
                         except Exception as e:
                             png = None
                             info_err = str(e)
@@ -2197,3 +2421,4 @@ with _main:
                     st.error(f"❌ Gagal: {info}")
 
         st.caption("⚠️ Tool bantu baca flow, BUKAN sinyal beli/jual. Validasi sendiri + manajemen risiko.")
+
