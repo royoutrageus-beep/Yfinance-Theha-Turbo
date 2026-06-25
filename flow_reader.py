@@ -295,21 +295,55 @@ def parse_broker_paste(text: str) -> pd.DataFrame:
     return rows
 
 
+def fmt_value(v):
+    """Format nilai Rupiah ke T/B/jt sesuai besarannya (konvensi IDX)."""
+    sign = "-" if v < 0 else ""
+    av = abs(v)
+    if av >= 1e12:
+        return f"{sign}{av/1e12:.2f}T"
+    if av >= 1e9:
+        return f"{sign}{av/1e9:.1f}B"
+    if av >= 1e6:
+        return f"{sign}{av/1e6:.0f}jt"
+    return f"{sign}{av:,.0f}"
+
+
 def to_num(x):
-    """Konversi '1,234' / '1.2K' / '3.4M' / '12,3' ke float."""
+    """Konversi '1,234' / '1.2K' / '3.4M' / '5.5B' / '1.2T' ke float.
+    Suffix: K=ribu, M/jt=juta, B/M=miliar, T=triliun (konvensi IDX/Stockbit)."""
     if x is None:
         return 0.0
     s = str(x).strip().replace(" ", "")
-    if s in ("", "-", "—"):
+    if s in ("", "-", "—", "–"):
         return 0.0
+    # buang suffix non-angka di akhir buat deteksi unit (cth "jt", "rb")
+    s_up = s.upper()
     mult = 1.0
-    if s[-1:].upper() == "K":
-        mult, s = 1e3, s[:-1]
-    elif s[-1:].upper() == "M":
-        mult, s = 1e6, s[:-1]
-    elif s[-1:].upper() == "B":
-        mult, s = 1e9, s[:-1]
-    s = s.replace(",", "")
+    has_unit = False
+    # cek multi-char dulu (jt, rb) sebelum single char
+    if s_up.endswith("JT"):           # juta
+        mult, s, has_unit = 1e6, s[:-2], True
+    elif s_up.endswith("RB"):          # ribu
+        mult, s, has_unit = 1e3, s[:-2], True
+    elif s_up.endswith("T"):           # triliun  ← INI YANG KURANG
+        mult, s, has_unit = 1e12, s[:-1], True
+    elif s_up.endswith("B"):           # billion / miliar
+        mult, s, has_unit = 1e9, s[:-1], True
+    elif s_up.endswith("M"):           # million / juta
+        mult, s, has_unit = 1e6, s[:-1], True
+    elif s_up.endswith("K"):           # ribu
+        mult, s, has_unit = 1e3, s[:-1], True
+    # normalisasi desimal:
+    if "," in s and "." in s:
+        s = s.replace(",", "")              # 1,234.5 → 1234.5 (koma ribuan)
+    elif "," in s:
+        # heuristik: cek digit setelah koma terakhir
+        # 3 digit (cth "1,500") → ribuan; 1-2 digit (cth "5,5") → desimal
+        after = s.split(",")[-1]
+        if len(after) == 3 and after.isdigit():
+            s = s.replace(",", "")          # 1,500 → 1500 (ribuan)
+        else:
+            s = s.replace(",", ".")         # 5,5 → 5.5 (desimal)
     try:
         return float(s) * mult
     except ValueError:
@@ -456,12 +490,7 @@ def build_flow_summary(result, buy_df, sell_df, last_price, bandar, ticker):
         top_seller = (ts["broker"], ts["val"], ts.get("avg", 0))
 
     def _fmt(v):
-        # B = miliar (billion), jt = juta — sesuai konvensi Stockbit/IDX
-        if v >= 1e9:
-            return f"{v/1e9:.1f}B"
-        if v >= 1e6:
-            return f"{v/1e6:.0f}jt"
-        return f"{v:,.0f}"
+        return fmt_value(v)
 
     if top_buyer:
         b_name, b_val, b_avg = top_buyer
@@ -761,13 +790,13 @@ def build_telegram_message(ticker, tf, result, card, summary, buy_df, sell_df,
     if buy_df is not None:
         L.append("🟢 Net Buyer:")
         for _, r in buy_df.nlargest(5, "val").iterrows():
-            v = f"{r['val']/1e9:.1f}B" if r['val'] >= 1e9 else f"{r['val']/1e6:.0f}jt"
+            v = fmt_value(r['val'])
             avg = f" @{r['avg']:,.0f}" if r.get('avg', 0) > 0 else ""
             L.append(f"  {r['broker']}: {v}{avg}")
     if sell_df is not None:
         L.append("🔴 Net Seller:")
         for _, r in sell_df.nlargest(5, "val").iterrows():
-            v = f"{r['val']/1e9:.1f}B" if r['val'] >= 1e9 else f"{r['val']/1e6:.0f}jt"
+            v = fmt_value(r['val'])
             avg = f" @{r['avg']:,.0f}" if r.get('avg', 0) > 0 else ""
             L.append(f"  {r['broker']}: {v}{avg}")
     L.append("")
@@ -827,7 +856,7 @@ def build_infographic_html(ticker, tf, result, card, summary, buy_df, sell_df,
     # legend broker
     legend_html = ""
     for name, pct, col, val in legend:
-        v = f"{val/1e9:.1f}B" if val >= 1e9 else f"{val/1e6:.0f}jt"
+        v = fmt_value(val)
         legend_html += (
             f'<div class="lg"><span class="dot" style="background:{col}"></span>'
             f'<b>{name}</b><span class="lgv">{v} · {pct:.1f}%</span></div>')
@@ -847,7 +876,7 @@ def build_infographic_html(ticker, tf, result, card, summary, buy_df, sell_df,
             return ""
         rows = ""
         for _, r in df.nlargest(6, "val").iterrows():
-            v = f"{r['val']/1e9:.1f}B" if r['val'] >= 1e9 else f"{r['val']/1e6:.0f}jt"
+            v = fmt_value(r['val'])
             avg = f"{r['avg']:,.0f}" if r.get('avg', 0) > 0 else "-"
             rows += (f'<tr><td class="bk" style="color:{color}">{r["broker"]}</td>'
                      f'<td>{v}</td><td>{avg}</td></tr>')
@@ -1227,7 +1256,7 @@ def render_infographic_pil(ticker, tf, result, card, summary, buy_df, sell_df,
             for i, (_, row) in enumerate(dn.iterrows()):
                 col = _hex(palette[i % len(palette)])
                 pct = row["val"] / d_total * 100
-                v = f"{row['val']/1e9:.1f}B" if row['val'] >= 1e9 else f"{row['val']/1e6:.0f}jt"
+                v = fmt_value(row['val'])
                 d.rounded_rectangle([lx, ly + 2, lx + 11, ly + 13], radius=3, fill=col)
                 d.text((lx + 18, ly), f"{row['broker']}", font=f_bodyb, fill=TXT)
                 d.text((left_x + col_w - 14, ly), f"{v} · {pct:.1f}%", font=f_mono,
@@ -1265,7 +1294,7 @@ def render_infographic_pil(ticker, tf, result, card, summary, buy_df, sell_df,
         d.text((x + col_w - 18, yy + 40), "AVG", font=_load_font(11), fill=MUTE, anchor="ra")
         ry = yy + 62
         for _, r in rows.iterrows():
-            v = f"{r['val']/1e9:.1f}B" if r['val'] >= 1e9 else f"{r['val']/1e6:.0f}jt"
+            v = fmt_value(r['val'])
             avg = f"{r['avg']:,.0f}" if r.get('avg', 0) > 0 else "-"
             d.text((x + 18, ry), r["broker"], font=f_mono, fill=_hex(color))
             d.text((x + col_w - 130, ry), v, font=f_mono, fill=TXT)
@@ -1373,7 +1402,7 @@ def build_chart(buy_df, sell_df, last_price, ticker):
         fig.add_trace(go.Bar(
             y=b["broker"], x=b["val"], orientation="h",
             marker_color="#16c784", name="Buy",
-            text=[f"{v/1e9:.1f}B" if v >= 1e9 else f"{v/1e6:.0f}jt" for v in b["val"]],
+            text=[fmt_value(v) for v in b["val"]],
             textposition="outside", textfont=dict(color="#16c784"),
         ), row=1, col=1)
 
@@ -1382,7 +1411,7 @@ def build_chart(buy_df, sell_df, last_price, ticker):
         fig.add_trace(go.Bar(
             y=s["broker"], x=s["val"], orientation="h",
             marker_color="#f85149", name="Sell",
-            text=[f"{v/1e9:.1f}B" if v >= 1e9 else f"{v/1e6:.0f}jt" for v in s["val"]],
+            text=[fmt_value(v) for v in s["val"]],
             textposition="outside", textfont=dict(color="#f85149"),
         ), row=1, col=2)
 
@@ -1438,7 +1467,7 @@ def _enrich_broker_data(buy_df, sell_df, last_price):
             if avg > 0 and last_price > 0:
                 d = (avg - last_price) / last_price * 100
                 pos = f", avg {avg:,.0f} ({d:+.1f}% vs harga)"
-            lines.append(f"    BUY  {r['broker']}: {r['val']/1e9:.1f}B ({pct:.0f}% sisi beli), "
+            lines.append(f"    BUY  {r['broker']}: {fmt_value(r['val'])} ({pct:.0f}% sisi beli), "
                          f"{r['lot']/1e3:.0f}rb lot{pos}")
     if sell_df is not None and len(sell_df) > 0:
         tot_s = sell_df["val"].sum()
@@ -1449,7 +1478,7 @@ def _enrich_broker_data(buy_df, sell_df, last_price):
             if avg > 0 and last_price > 0:
                 d = (avg - last_price) / last_price * 100
                 pos = f", avg {avg:,.0f} ({d:+.1f}% vs harga)"
-            lines.append(f"    SELL {r['broker']}: {r['val']/1e9:.1f}B ({pct:.0f}% sisi jual), "
+            lines.append(f"    SELL {r['broker']}: {fmt_value(r['val'])} ({pct:.0f}% sisi jual), "
                          f"{r['lot']/1e3:.0f}rb lot{pos}")
     return "\n".join(lines)
 
@@ -1473,9 +1502,9 @@ BROKER SUMMARY (sisi beli vs jual, % share, avg vs harga):
 {broker_detail}
 
 AGREGAT:
-- Total nilai BELI: {tot_buy/1e9:.1f}B
-- Total nilai JUAL: {tot_sell/1e9:.1f}B
-- Net flow: {net/1e9:+.1f}B ({'beli unggul' if net>0 else 'jual unggul' if net<0 else 'imbang'})
+- Total nilai BELI: {fmt_value(tot_buy)}
+- Total nilai JUAL: {fmt_value(tot_sell)}
+- Net flow: {('+' if net>=0 else '')+fmt_value(net)} ({'beli unggul' if net>0 else 'jual unggul' if net<0 else 'imbang'})
 - Big money net: {bandar.get('big_net')} lot | Retail net: {bandar.get('retail_net')} lot
 - Running trade: lifting offer {running.get('lifting')} vs hitting bid {running.get('hitting')}
 - Catatan trader: {notes or '-'}
@@ -1891,13 +1920,13 @@ with _main:
             if buy_df is not None:
                 st.markdown("**🟢 Net Buyer**")
                 show = buy_df.nlargest(10, "val").copy()
-                show["val"] = show["val"].map(lambda v: f"{v/1e9:.2f}B" if v >= 1e9 else f"{v/1e6:.1f}jt")
+                show["val"] = show["val"].map(fmt_value)
                 st.dataframe(show, use_container_width=True, hide_index=True)
         with cc2:
             if sell_df is not None:
                 st.markdown("**🔴 Net Seller**")
                 show = sell_df.nlargest(10, "val").copy()
-                show["val"] = show["val"].map(lambda v: f"{v/1e9:.2f}B" if v >= 1e9 else f"{v/1e6:.1f}jt")
+                show["val"] = show["val"].map(fmt_value)
                 st.dataframe(show, use_container_width=True, hide_index=True)
 
         # ── NARASI AI ──
